@@ -55,6 +55,8 @@ DOC_SOURCE = \
 	Documentation/internals/patchwork.rst \
 	Documentation/internals/release-process.rst \
 	Documentation/internals/security.rst \
+	Documentation/internals/ovn-binary-transport-architecture.md \
+	Documentation/internals/ovn-binary-transport-implementation-plan.md \
 	Documentation/internals/contributing/index.rst \
 	Documentation/internals/contributing/backporting-patches.rst \
 	Documentation/internals/contributing/inclusive-language.rst \
