@@ -856,6 +856,12 @@ update_sb_db(struct ovsdb_idl *ovs_idl, struct ovsdb_idl *ovnsb_idl,
     if (monitor_all_p) {
         *monitor_all_p = monitor_all;
     }
+
+    bool binary_transport =
+        get_chassis_external_id_value_bool(
+            &cfg->external_ids, chassis_id, "ovn-binary-transport", true);
+    ovsdb_idl_set_binary_transport(ovnsb_idl, binary_transport);
+
     if (reset_ovnsb_idl_min_index && *reset_ovnsb_idl_min_index) {
         VLOG_INFO("Resetting southbound database cluster state");
         engine_set_force_recompute();
@@ -5405,6 +5411,7 @@ main(int argc, char *argv[])
     struct ovsdb_idl_loop ovs_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovs_remote, &ovsrec_idl_class, false, true));
     ctrl_register_ovs_idl(ovs_idl_loop.idl);
+    ovsdb_idl_set_binary_transport(ovs_idl_loop.idl, true);
 
     struct ovsdb_idl_index *ovsrec_port_by_interfaces
         = ovsdb_idl_index_create1(ovs_idl_loop.idl,
@@ -5429,6 +5436,7 @@ main(int argc, char *argv[])
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create_unconnected(&sbrec_idl_class, true));
     ovsdb_idl_set_leader_only(ovnsb_idl_loop.idl, false);
+    ovsdb_idl_set_binary_transport(ovnsb_idl_loop.idl, true);
 
     unixctl_command_register("connection-status", "", 0, 0,
                              ovn_conn_show, ovnsb_idl_loop.idl);
