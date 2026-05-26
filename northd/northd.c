@@ -5013,6 +5013,28 @@ fail:
     return false;
 }
 
+/* Handle changes to the Logical_Router_Port table.
+ *
+ * Uses the lr_ports hmap to find the parent router for each changed LRP.
+ * Currently falls back to full recompute for all LRP changes.  Future
+ * phases will add per-LRP incremental flow generation. */
+bool
+northd_handle_lrp_changes(const struct northd_input *ni OVS_UNUSED,
+                          struct northd_data *nd OVS_UNUSED)
+{
+    /* For now, any change to a logical router port triggers full recompute.
+     * The engine node registration ensures this handler is called when LRP
+     * rows change independently of their parent router.
+     *
+     * Future phases will:
+     * - Look up the port via ovn_port_find(&nd->lr_ports, lrp->name)
+     * - Find parent router via op->od
+     * - Handle create/update/delete incrementally with lflow_ref
+     * - Track changes in trk_lrps (created/updated/deleted)
+     */
+    return false;
+}
+
 bool
 northd_handle_sb_port_binding_changes(
     const struct sbrec_port_binding_table *sbrec_port_binding_table,
