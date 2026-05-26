@@ -4323,6 +4323,8 @@ destroy_northd_data_tracked_changes(struct northd_data *nd)
     hmapx_clear(&trk_changes->trk_nat_lrs);
     hmapx_clear(&trk_changes->ls_with_changed_lbs);
     hmapx_clear(&trk_changes->ls_with_changed_acls);
+    hmapx_clear(&trk_changes->trk_created_lrs);
+    hmapx_clear(&trk_changes->trk_deleted_lrs);
     trk_changes->type = NORTHD_TRACKED_NONE;
 }
 
@@ -4339,6 +4341,8 @@ init_northd_tracked_data(struct northd_data *nd)
     hmapx_init(&trk_data->trk_nat_lrs);
     hmapx_init(&trk_data->ls_with_changed_lbs);
     hmapx_init(&trk_data->ls_with_changed_acls);
+    hmapx_init(&trk_data->trk_created_lrs);
+    hmapx_init(&trk_data->trk_deleted_lrs);
 }
 
 static void
@@ -4354,6 +4358,8 @@ destroy_northd_tracked_data(struct northd_data *nd)
     hmapx_destroy(&trk_data->trk_nat_lrs);
     hmapx_destroy(&trk_data->ls_with_changed_lbs);
     hmapx_destroy(&trk_data->ls_with_changed_acls);
+    hmapx_destroy(&trk_data->trk_created_lrs);
+    hmapx_destroy(&trk_data->trk_deleted_lrs);
 }
 
 /* Check if a changed LSP can be handled incrementally within the I-P engine
@@ -4963,6 +4969,10 @@ northd_handle_lr_changes(const struct northd_input *ni,
                                              ni->nbrec_logical_router_table) {
         if (nbrec_logical_router_is_new(changed_lr) ||
             nbrec_logical_router_is_deleted(changed_lr)) {
+            /* Router creation/deletion requires datapath materialization
+             * and cleanup that is not yet implemented incrementally.
+             * Phase C.2+ will add actual datapath create/destroy here.
+             * For now, fall back to full recompute. */
             goto fail;
         }
 
@@ -4992,6 +5002,10 @@ northd_handle_lr_changes(const struct northd_input *ni,
     if (!hmapx_is_empty(&nd->trk_data.trk_nat_lrs)) {
         nd->trk_data.type |= NORTHD_TRACKED_LR_NATS;
     }
+
+    /* NORTHD_TRACKED_LR_CREATED and NORTHD_TRACKED_LR_DELETED are
+     * defined but not yet set here — Phase C.2+ will add actual
+     * datapath materialization before setting these flags. */
 
     return true;
 fail:

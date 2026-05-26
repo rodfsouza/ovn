@@ -115,11 +115,13 @@ struct tracked_lbs {
 
 enum northd_tracked_data_type {
     NORTHD_TRACKED_NONE,
-    NORTHD_TRACKED_PORTS    = (1 << 0),
-    NORTHD_TRACKED_LBS      = (1 << 1),
-    NORTHD_TRACKED_LR_NATS  = (1 << 2),
-    NORTHD_TRACKED_LS_LBS   = (1 << 3),
-    NORTHD_TRACKED_LS_ACLS  = (1 << 4),
+    NORTHD_TRACKED_PORTS       = (1 << 0),
+    NORTHD_TRACKED_LBS         = (1 << 1),
+    NORTHD_TRACKED_LR_NATS     = (1 << 2),
+    NORTHD_TRACKED_LS_LBS      = (1 << 3),
+    NORTHD_TRACKED_LS_ACLS     = (1 << 4),
+    NORTHD_TRACKED_LR_CREATED  = (1 << 5),
+    NORTHD_TRACKED_LR_DELETED  = (1 << 6),
 };
 
 /* Track what's changed in the northd engine node.
@@ -142,6 +144,14 @@ struct northd_tracked_data {
     /* Tracked logical switches whose ACLs have changed.
      * hmapx node is 'struct ovn_datapath *'. */
     struct hmapx ls_with_changed_acls;
+
+    /* Tracked created logical routers.
+     * hmapx node is 'struct ovn_datapath *'. */
+    struct hmapx trk_created_lrs;
+
+    /* Tracked deleted logical routers.
+     * hmapx node is 'struct ovn_datapath *'. */
+    struct hmapx trk_deleted_lrs;
 };
 
 struct northd_data {

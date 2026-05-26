@@ -213,3 +213,67 @@ BUILD_NBDB(OVN_BASIC_SCALE_CONFIG(500, 50))
 OVN_CLEANUP_NORTHD
 AT_CLEANUP
 ])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- binary transport router creation cost])
+AT_KEYWORDS([binary-transport perf])
+
+ovn_start
+
+# Build scale topology: 10 routers, 20 switches, 200 ports, 10 NATs
+OVN_NBCTL(
+    [for i in $(seq 1 10); do
+        lr-add lr$i
+        for j in $(seq 1 2); do
+            ls-add ls${i}_${j}
+            lrp-add lr$i rp${i}_${j} f0:00:00:0$i:0$j:01 10.$i.$j.1/24
+            lsp-add ls${i}_${j} lsp${i}_${j}_rp -- lsp-set-type lsp${i}_${j}_rp router \
+                -- lsp-set-addresses lsp${i}_${j}_rp router \
+                -- lsp-set-options lsp${i}_${j}_rp router-port=rp${i}_${j}
+            for k in $(seq 1 10); do
+                lsp-add ls${i}_${j} lsp${i}_${j}_${k} \
+                    -- lsp-set-addresses lsp${i}_${j}_${k} \
+                       "f0:00:00:0$i:0$j:$(printf '%02x' $k) 10.$i.$j.$((k+10))"
+            done
+        done
+        lr-nat-add lr$i dnat_and_snat 172.16.$i.1 10.$i.1.11
+    done]
+)
+RUN_OVN_NBCTL()
+
+check ovn-nbctl --wait=sb sync
+
+# Measure full recompute cost
+check ovn-appctl -t northd/ovn-northd inc-engine/clear-stats
+check ovn-appctl -t northd/ovn-northd stopwatch/reset
+
+PERF_RECORD_START(Full recompute with binary transport)
+check ovn-appctl -t northd/ovn-northd inc-engine/recompute
+check ovn-nbctl --wait=sb sync
+PERF_RECORD_STOP()
+
+# Measure router creation cost (triggers full recompute today)
+check ovn-appctl -t northd/ovn-northd inc-engine/clear-stats
+check ovn-appctl -t northd/ovn-northd stopwatch/reset
+
+PERF_RECORD_START(Router creation cost)
+check ovn-nbctl --wait=sb lr-add lr_new
+check ovn-nbctl --wait=sb lrp-add lr_new rp_new f0:00:ff:00:00:01 10.99.1.1/24
+PERF_RECORD_STOP()
+
+# Verify engine stats: router creation triggers recompute
+check ovn-appctl -t northd/ovn-northd inc-engine/show-stats northd recompute
+
+# Measure incremental NAT add cost (should be handled incrementally)
+check ovn-appctl -t northd/ovn-northd inc-engine/clear-stats
+check ovn-appctl -t northd/ovn-northd stopwatch/reset
+
+PERF_RECORD_START(Incremental NAT add)
+check ovn-nbctl --wait=sb lr-nat-add lr1 snat 172.16.1.100 10.1.0.0/16
+PERF_RECORD_STOP()
+
+check ovn-appctl -t northd/ovn-northd inc-engine/show-stats northd recompute
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
