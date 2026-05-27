@@ -6,13 +6,14 @@
 |-------|--------|--------|-------|
 | **A** | **DONE** | OVS `aed87a9f7` | Direct binary→datum path. Eliminates JSON round-trip for ROW_BATCH. |
 | **B** | **DONE** | OVN `a4cd3936a` | Perf test in `tests/perf-northd.at`. |
-| **C.1** | **DONE** | OVN `b77f6cf93` | Actual datapath materialization for standalone routers. |
+| **C.1** | **DONE** | OVN `b77f6cf93` | Datapath materialization for standalone routers. `northd norecompute`. |
 | **C.2** | **DONE** | OVN `12c9051f5` | 4 new engine nodes (LRP, static_route, policy, NAT). |
 | **C.3** | **DONE** | OVN `12c9051f5` | LRP handler wired into DAG (returns false — safe fallback). |
-| **C.4** | **DONE** | OVN `7d413942f` | Per-datapath `lflow_ref` system. 3 refs per datapath (general, route, policy). All 16 flow builders threaded. Lflow handler generates flows incrementally for new routers. |
-| **C.5** | **DONE** | OVN `7d413942f` | `is_lr_static_routes_changed()`, `lr_changes_can_be_handled()` extended, per-router route flow rebuild via `od->route_lflow_ref`. `northd + lflow norecompute compute`. |
-| **C.6** | IN PROGRESS | — | Router + ports in same transaction. Requires LRP handler implementation. |
-| **C.7** | **DONE** | OVN `7d413942f` | `is_lr_policies_changed()`, per-router policy flow rebuild via `od->policy_lflow_ref`. `northd + lflow norecompute compute`. |
+| **C.4** | **DONE** | OVN `7d413942f` | Per-datapath `lflow_ref` system. 3 refs per datapath threaded through 16 flow builders. Lflow generates flows incrementally for new routers. `northd + lflow norecompute`. |
+| **C.5** | **DONE** | OVN `7d413942f` | `is_lr_static_routes_changed()`, `lr_changes_can_be_handled()` extended. Per-router route flow rebuild via `od->route_lflow_ref`. `northd + lflow norecompute`. |
+| **C.6** | **DONE** | OVN `4987eb03c` | Router + ports in same txn. Inline LRP creation with `ovn_port_create()` + `ovn_port_update_sbrec()`. DGW/LB ports fall back. `northd norecompute`. |
+| **C.7** | **DONE** | OVN `7d413942f` | `is_lr_policies_changed()`, per-router policy flow rebuild via `od->policy_lflow_ref`. `northd + lflow norecompute`. |
+| **C.del** | **DONE** | OVN `4987eb03c` | Standalone router deletion. Clears lflow_refs, deletes SB datapath_binding, destroys ovn_datapath. Routers with ports/lr_group fall back. `northd norecompute + lflow recompute`. |
 | **D** | NOT STARTED | — | Binary UPDATE_BATCH with direct datum path. XOR support needed. |
 | **E** | NOT STARTED | — | Streaming-aware batch processing. |
 
@@ -20,25 +21,33 @@
 
 | Operation | northd | lflow | Status |
 |-----------|--------|-------|--------|
-| Standalone router add | **norecompute** | **norecompute** | DONE |
-| Static route change | **norecompute** | **norecompute** | DONE |
-| Policy change | **norecompute** | **norecompute** | DONE |
+| Standalone router add | **norecompute** | **norecompute** | C.1 + C.4 |
+| Router + ports (no DGW) | **norecompute** | **norecompute** | C.6 |
+| Router + ports + NAT | **norecompute** | **norecompute** | C.6 |
+| Router + ports + routes | **norecompute** | **norecompute** | C.6 + C.5 |
+| Static route change | **norecompute** | **norecompute** | C.5 |
+| Policy change | **norecompute** | **norecompute** | C.7 |
 | NAT change | **norecompute** | recompute | Existing (pre-C.4) |
 | LB change | **norecompute** | **norecompute** | Existing |
-| Router + ports (same txn) | recompute | recompute | C.6 TODO |
-| LRP add/modify/delete | recompute | recompute | C.6 TODO |
-| Router deletion | recompute | recompute | TODO |
-| DGW port changes | recompute | recompute | Always fallback |
+| Standalone router delete | **norecompute** | recompute | C.del |
+| LRP add/modify/delete | recompute | recompute | LRP handler returns false |
+| Router + DGW ports | recompute | recompute | DGW fallback |
+| Router + LB (same txn) | recompute | recompute | LB fallback |
+| Router delete with ports | recompute | recompute | Ports/lr_group fallback |
 
 ### Remaining Work
 
-1. **C.6 — Router + ports**: Remove `n_ports > 0` fallback. Implement LRP create handler with port creation, SB port_binding, per-LRP flow generation.
+1. **LRP handler on existing routers**: `northd_handle_lrp_changes()` returns false. Full implementation needs: port lookup via `lr_ports`, `ovn_port_create()`, `ovn_port_update_sbrec()`, per-LRP flow generation, peer port linking.
 
-2. **Router deletion**: Unlink all `lflow_ref`s, delete SB `datapath_binding`, clean `lr_group`, remove from `lr_datapaths`.
+2. **Router deletion with ports**: Requires iterating `od->ports`, deleting each port's SB `port_binding`, unlinking per-port `lflow_ref`, cleaning `lr_group` back-references.
 
-3. **LRP handler**: Replace `return false` with actual create/update/delete handling via `lr_ports` lookup and `op->lflow_ref`.
+3. **DGW port support**: `create_cr_port()` creates chassis-redirect derived ports with complex HA chassis group handling. Deferred indefinitely.
 
-4. **Binary XOR** (Phase D): Add `ovsdb_datum_apply_diff_in_place()` support.
+4. **LB on new router**: `build_lb_datapaths()` associates LBs with routers. Not yet called incrementally.
+
+5. **Binary XOR** (Phase D): Add `ovsdb_datum_apply_diff_in_place()` support to `ovsdb_idl_binary_row_change()`.
+
+6. **Batch accumulation** (Phase E): Accumulate binary frames before `engine_run()`.
 
 ---
 
