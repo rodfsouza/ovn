@@ -1,32 +1,44 @@
 # Plan: Optimize Northd Incremental Flow Processing with Binary Transport
 
-## Implementation Status (2026-05-26)
+## Implementation Status (2026-05-27)
 
 | Phase | Status | Commit | Notes |
 |-------|--------|--------|-------|
 | **A** | **DONE** | OVS `aed87a9f7` | Direct binary→datum path. Eliminates JSON round-trip for ROW_BATCH. |
 | **B** | **DONE** | OVN `a4cd3936a` | Perf test in `tests/perf-northd.at`. |
-| **C.1** | **DONE** | OVN (uncommitted) | Actual datapath materialization for standalone routers. `northd norecompute compute`. |
-| **C.2** | **DONE** | OVN (uncommitted) | 4 new engine nodes (LRP, static_route, policy, NAT). |
-| **C.3** | **DONE** | OVN (uncommitted) | LRP handler (returns false — safe recompute fallback). |
-| **C.4** | NOT STARTED | — | Per-LRP incremental flow generation with `lflow_ref`. Requires per-datapath `lflow_ref`. |
-| **C.5** | NOT STARTED | — | Incremental static route handling. |
-| **C.6** | NOT STARTED | — | Router + ports in single transaction (Tier 2). |
-| **C.7** | NOT STARTED | — | Incremental policy handling. |
+| **C.1** | **DONE** | OVN `b77f6cf93` | Actual datapath materialization for standalone routers. |
+| **C.2** | **DONE** | OVN `12c9051f5` | 4 new engine nodes (LRP, static_route, policy, NAT). |
+| **C.3** | **DONE** | OVN `12c9051f5` | LRP handler wired into DAG (returns false — safe fallback). |
+| **C.4** | **DONE** | OVN `7d413942f` | Per-datapath `lflow_ref` system. 3 refs per datapath (general, route, policy). All 16 flow builders threaded. Lflow handler generates flows incrementally for new routers. |
+| **C.5** | **DONE** | OVN `7d413942f` | `is_lr_static_routes_changed()`, `lr_changes_can_be_handled()` extended, per-router route flow rebuild via `od->route_lflow_ref`. `northd + lflow norecompute compute`. |
+| **C.6** | IN PROGRESS | — | Router + ports in same transaction. Requires LRP handler implementation. |
+| **C.7** | **DONE** | OVN `7d413942f` | `is_lr_policies_changed()`, per-router policy flow rebuild via `od->policy_lflow_ref`. `northd + lflow norecompute compute`. |
 | **D** | NOT STARTED | — | Binary UPDATE_BATCH with direct datum path. XOR support needed. |
 | **E** | NOT STARTED | — | Streaming-aware batch processing. |
 
-### Key Remaining Work for Full Incremental Path
+### Current Incremental Behavior
 
-1. **Per-datapath `lflow_ref`**: Add `struct lflow_ref *lflow_ref` to `struct ovn_datapath`. This enables lflow handler to generate only the new router's flows instead of full recompute. Changes `lflow` column from "recompute" to "norecompute compute".
+| Operation | northd | lflow | Status |
+|-----------|--------|-------|--------|
+| Standalone router add | **norecompute** | **norecompute** | DONE |
+| Static route change | **norecompute** | **norecompute** | DONE |
+| Policy change | **norecompute** | **norecompute** | DONE |
+| NAT change | **norecompute** | recompute | Existing (pre-C.4) |
+| LB change | **norecompute** | **norecompute** | Existing |
+| Router + ports (same txn) | recompute | recompute | C.6 TODO |
+| LRP add/modify/delete | recompute | recompute | C.6 TODO |
+| Router deletion | recompute | recompute | TODO |
+| DGW port changes | recompute | recompute | Always fallback |
 
-2. **`lr_group` creation**: `build_lrouter_groups()` is not called incrementally. New standalone router needs a single-member `lr_group`. Must be created in `northd_handle_lr_changes()` after datapath materialization.
+### Remaining Work
 
-3. **Router deletion**: Requires cleaning up flows (via `lflow_ref`), SB `datapath_binding`, `lr_group` membership, and `lr_datapaths` hmap/array. Complex due to cross-datapath references.
+1. **C.6 — Router + ports**: Remove `n_ports > 0` fallback. Implement LRP create handler with port creation, SB port_binding, per-LRP flow generation.
 
-4. **Per-LRP handling**: `northd_handle_lrp_changes()` currently returns false. Full implementation needs: port lookup via `lr_ports`, parent via `op->od`, per-LRP flow generation via `build_lswitch_and_lrouter_iterate_by_lrp()`, and `lflow_ref_sync_lflows()`.
+2. **Router deletion**: Unlink all `lflow_ref`s, delete SB `datapath_binding`, clean `lr_group`, remove from `lr_datapaths`.
 
-5. **Binary XOR support**: `ovsdb_idl_binary_row_change()` has `OVS_NOT_REACHED()` for XOR mode. Phase D needs `ovsdb_datum_apply_diff_in_place()` support.
+3. **LRP handler**: Replace `return false` with actual create/update/delete handling via `lr_ports` lookup and `op->lflow_ref`.
+
+4. **Binary XOR** (Phase D): Add `ovsdb_datum_apply_diff_in_place()` support.
 
 ---
 
