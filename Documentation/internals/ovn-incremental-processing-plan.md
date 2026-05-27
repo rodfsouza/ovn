@@ -1,4 +1,8 @@
-# Plan: Optimize Northd Incremental Flow Processing with Binary Transport
+# OVN Incremental Processing Plan
+
+Optimizing northd incremental flow processing for router operations.
+Binary transport optimization (Phase A) is documented in the OVS repo at
+`Documentation/internals/ovsdb-binary-transport-architecture.md`.
 
 ## Implementation Status (2026-05-27)
 

@@ -1,13 +1,16 @@
-# Architecture: Incremental Router Processing & Binary Transport Optimization
+# OVN Incremental Processing Architecture
 
 ## Overview
 
-This document describes the architectural changes made to OVS and OVN to optimize
-database synchronization and incremental flow processing for large-scale deployments.
+This document describes the incremental processing changes in OVN northd
+that avoid full recompute of logical flows when router configuration changes.
 
-Two complementary optimizations:
-1. **Binary→Datum Direct Path** (OVS): Eliminates JSON intermediate in binary transport
-2. **Incremental Router Creation** (OVN): Avoids full northd recompute on router add
+Binary transport optimization (Phase A) is documented in the OVS repo at
+`Documentation/internals/ovsdb-binary-transport-architecture.md`.
+
+Key optimization: per-datapath `lflow_ref` system enabling targeted flow
+rebuild for router creation, static route changes, and policy changes
+without rebuilding all flows in the deployment.
 
 ## 1. Binary Transport Direct Path (Phase A)
 
