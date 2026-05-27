@@ -1,423 +1,303 @@
 # OVN Incremental Processing Architecture
 
-## Overview
+## 1. Overview
 
-This document describes the incremental processing changes in OVN northd
-that avoid full recompute of logical flows when router configuration changes.
+This document explains how OVN's northd daemon processes configuration changes
+incrementally, avoiding expensive full recomputation of logical flows. It covers
+the core infrastructure (engine, DAG, IDL change tracking, lflow_ref system) and
+the specific optimizations for router operations.
 
-Binary transport optimization (Phase A) is documented in the OVS repo at
-`Documentation/internals/ovsdb-binary-transport-architecture.md`.
+Binary transport optimization (Phase A) is documented separately in the OVS repo
+at `Documentation/internals/ovsdb-binary-transport-architecture.md`.
 
-Key optimization: per-datapath `lflow_ref` system enabling targeted flow
-rebuild for router creation, static route changes, and policy changes
-without rebuilding all flows in the deployment.
+## 2. OVN Architecture Context
 
-## 1. Binary Transport Direct Path (Phase A)
-
-### Problem
-
-The binary transport protocol sends OVSDB data in a compact binary wire format,
-but the client-side IDL was converting it back to JSON before parsing:
+OVN translates high-level network configuration into OpenFlow rules:
 
 ```
-BEFORE (wasteful round-trip):
-
-  Server                    Client (IDL)
-    |                           |
-    |--- ROW_BATCH (binary) --->|
-    |                           |-- ovsdb_binary_deserialize_datum() --> datum
-    |                           |-- ovsdb_datum_to_json()            --> JSON  (!)
-    |                           |-- ovsdb_datum_from_json()          --> datum (!)
-    |                           |-- write to row->old_datum
+  Northbound DB (NB)           ovn-northd              Southbound DB (SB)
+  ┌──────────────────┐    ┌─────────────────┐    ┌──────────────────────┐
+  │ Logical_Switch   │    │                 │    │ Datapath_Binding     │
+  │ Logical_Router   │───>│  Reads NB       │───>│ Port_Binding         │
+  │ ACL, NAT, LB     │    │  Computes flows │    │ Logical_Flow         │
+  │ LRP, LSP, Policy │    │  Writes SB      │    │ Multicast_Group      │
+  └──────────────────┘    └─────────────────┘    └──────────────────────┘
+                                                          │
+                                                          v
+                                                  ovn-controller
+                                                  (on each hypervisor)
+                                                          │
+                                                          v
+                                                    OpenFlow rules
+                                                    (in OVS bridge)
 ```
 
-### Solution
+**northd** is the centralized daemon that reads the NB database (network intent)
+and writes the SB database (computed forwarding state). It runs in a loop:
 
-New event type `OVSDB_CS_EVENT_TYPE_BINARY_UPDATE` carries pre-deserialized
-`ovsdb_datum` values directly from binary wire to IDL row storage:
+1. Fetch NB/SB changes via OVSDB IDL
+2. Process changes through the engine
+3. Commit SB writes
+
+At scale (1,000+ routers, 10,000+ ports), a naive approach rebuilds ALL computed
+state on every change. A single router addition would regenerate hundreds of
+thousands of logical flows across all datapaths. The incremental processing
+engine exists to avoid this.
+
+## 3. The Incremental Processing Engine
+
+### Why It Exists
+
+Without incremental processing, northd's main loop does this on every change:
 
 ```
-AFTER (direct path):
-
-  Server                    Client (IDL)
-    |                           |
-    |--- ROW_BATCH (binary) --->|
-    |                           |-- ovsdb_binary_deserialize_datum() --> datum
-    |                           |-- ovsdb_datum_clone()              --> row->old_datum
-    |                           |   (no JSON intermediate)
+Full recompute (expensive):
+  destroy ALL datapaths, ports, LB mappings
+  rebuild ALL datapaths from NB
+  rebuild ALL ports from NB
+  rebuild ALL LB associations
+  generate ALL logical flows (100K+ at scale)
+  diff ALL flows against SB
+  write changes to SB
 ```
 
-### Data Flow Diagram
+This is O(total_state) per change. With incremental processing, adding a single
+router only creates that router's datapath and generates its ~50-100 flows:
 
 ```
-                    Binary Wire
-                        |
-                        v
-            +-------------------------+
-            | ovsdb_cs_process_       |
-            | binary_row_batch()      |
-            | (ovsdb-cs.c)           |
-            +-------------------------+
-                        |
-            Produces BINARY_UPDATE event
-            with ovsdb_cs_binary_db_update
-                        |
-                        v
-            +-------------------------+
-            | ovsdb_idl_run()         |
-            | (ovsdb-idl.c)          |
-            +-------------------------+
-                        |
-                        v
-            +-------------------------+
-            | ovsdb_idl_process_      |
-            | binary_update()         |
-            +-------------------------+
-                    |       |
-            +-------+       +--------+
-            v                        v
-  +-------------------+    +-------------------+
-  | binary_insert_row |    | binary_modify_row |
-  | - init defaults   |    | - remove indexes  |
-  | - binary_row_     |    | - unparse         |
-  |   change()        |    | - binary_row_     |
-  | - parse           |    |   change()        |
-  | - add indexes     |    | - parse           |
-  +-------------------+    | - add indexes     |
-                           +-------------------+
-                                    |
-                                    v
-                         +-------------------+
-                         | binary_row_change |
-                         | - clone datum     |
-                         | - compare + swap  |
-                         | - track changes   |
-                         |   (seqno, bitmap, |
-                         |    track_list)    |
-                         +-------------------+
+Incremental (cheap):
+  create ONE new datapath
+  create its ports
+  generate ~50-100 flows for the new router
+  insert those flows into SB
+  done — existing routers untouched
 ```
 
-### Key Structures (ovsdb-cs.h)
+This is O(changed_state) per change.
+
+### What It Is
+
+The engine is a DAG (Directed Acyclic Graph) of processing nodes. Each node:
+- Holds some computed state (e.g., the set of all datapaths, or all logical flows)
+- Declares which other nodes it depends on (its inputs)
+- Has a **handler** for each input that tries to apply changes incrementally
+- Has a **recompute function** (`run()`) that rebuilds everything from scratch
+
+On each iteration, the engine evaluates nodes in topological order. For each node,
+it checks whether any input changed. If so, it calls the handler. If the handler
+succeeds (returns `true`), the change was applied incrementally. If it fails
+(returns `false`), the engine falls back to the node's recompute function.
+
+### The Key Insight
+
+A handler returning `true` means: "I updated this node's data to reflect the
+input change, without touching anything else."
+
+A handler returning `false` means: "This change is too complex for me to handle
+surgically. Please rebuild everything from scratch."
+
+This gives developers a safe escape hatch — any change that's too complex to
+handle incrementally simply returns `false`, and the engine does the right thing.
+New incremental handlers can be added one operation at a time without risk.
+
+## 4. The Engine DAG
+
+### Nodes
+
+The engine has three kinds of nodes:
+
+**Leaf nodes** (NB_NODE, SB_NODE) — represent OVSDB tables. They have no inputs.
+Their `run()` function checks the IDL for tracked row changes. If any rows
+changed, the node state becomes `EN_UPDATED`.
+
+**Computed nodes** (ENGINE_NODE) — hold derived state computed from inputs. They
+have a `run()` recompute function and per-input handlers. Examples: `en_northd`
+(datapaths, ports), `en_lflow` (logical flows), `en_lb_data` (load balancers).
+
+**Output nodes** — the root of the DAG. `en_northd_output` is the final node
+whose completion means all SB writes are done.
+
+### Wiring Inputs
+
+Dependencies and handlers are wired in `inc-proc-northd.c`:
 
 ```c
-struct ovsdb_cs_binary_column {
-    char *col_name;              // Column name from wire
-    struct ovsdb_datum datum;    // Pre-deserialized value
-    struct ovsdb_type col_type;  // Wire-format type (permissive)
-};
+/* en_northd depends on NB logical_router changes.
+ * When the table changes, call northd_nb_logical_router_handler(). */
+engine_add_input(&en_northd, &en_nb_logical_router,
+                 northd_nb_logical_router_handler);
 
-struct ovsdb_cs_binary_row_update {
-    struct uuid row_uuid;
-    enum ovsdb_cs_row_update_type type;  // INSERT (Phase A), future: UPDATE/DELETE
-    struct ovsdb_cs_binary_column *columns;
-    size_t n_columns;
-};
+/* en_northd depends on NB mirror changes.
+ * NULL handler means ANY change triggers full recompute. */
+engine_add_input(&en_northd, &en_nb_mirror, NULL);
 
-struct ovsdb_cs_binary_db_update {
-    struct ovsdb_cs_binary_table_update *table_updates;
-    size_t n;                    // Always 1 per ROW_BATCH frame
-};
+/* en_lflow depends on en_northd.
+ * When northd data changes, call lflow_northd_handler(). */
+engine_add_input(&en_lflow, &en_northd, lflow_northd_handler);
 ```
 
-### Change Tracking Parity
+### Node States
 
-`ovsdb_idl_binary_row_change()` replicates exact same tracking as the JSON path:
-- `change_seqno` incremented on ALERT-mode column changes
-- `row->updated` bitmap set for TRACK-mode columns
-- `row->track_node` added to `table->track_list`
-- `add_tracked_change_for_references()` called for recursive ref tracking
+Each node has a state that drives the evaluation:
 
-## 2. Incremental Router Creation (Phase C)
+| State | Meaning |
+|-------|---------|
+| `EN_STALE` | Data not yet computed this iteration (initial state) |
+| `EN_UPDATED` | Data was recomputed or incrementally updated |
+| `EN_UNCHANGED` | Inputs were checked but nothing changed |
+| `EN_ABORTED` | Recompute needed but not allowed (engine stops) |
 
-### Problem
+### Evaluation Algorithm
 
-When a router is created, northd's incremental processing engine (IPE) triggers
-a **full recompute** of ALL datapaths, ports, load balancers, and logical flows:
-
-```
-BEFORE:
-
-  NB: lr-add lr_new
-       |
-       v
-  northd_handle_lr_changes()
-       |
-       +-- nbrec_logical_router_is_new() == true
-       |
-       +-- goto fail  -->  FULL RECOMPUTE
-                           |
-                           +-- destroy ALL datapaths
-                           +-- rebuild ALL datapaths
-                           +-- rebuild ALL ports
-                           +-- rebuild ALL LB associations
-                           +-- rebuild ALL logical flows
-                           +-- sync ALL to SB
-```
-
-At scale (1,000+ routers), this rebuilds hundreds of thousands of flows.
-
-### Solution
-
-Router creation with any configuration (ports, NATs, LBs, routes, policies)
-is handled incrementally — only the new router's datapath and flows are created:
+`engine_run()` processes nodes in topological order (leaves first, root last):
 
 ```
-AFTER:
+for each node in topological order:
+    if node has no inputs (leaf):
+        node->run()          # check IDL for tracked changes
+        continue
 
-  NB: lr-add lr_new -- lrp-add lr_new rp1 ...
-       |
-       v
-  northd_handle_lr_changes()
-       |
-       +-- nbrec_logical_router_is_new() == true
-       +-- reject only: disabled, DGW ports
-       |
-       +-- INCREMENTAL:
-           |
-           +-- ovn_datapath_create()
-           +-- allocate tunnel key
-           +-- insert SB datapath_binding
-           +-- init mcast info
-           +-- add to lr_list, rebuild array index
-           +-- for each LRP:
-           |     +-- ovn_port_create()
-           |     +-- extract_lrp_networks()
-           |     +-- ovn_port_allocate_key()
-           |     +-- sbrec_port_binding_insert()
-           |     +-- ovn_port_update_sbrec()
-           +-- track NATs/routes/policies if present
-           +-- track as NORTHD_TRACKED_LR_CREATED
-           |
-           v
-       en_lflow detects LR_CREATED
-           |
-           +-- build_lr_flows_for_datapath(od)
-           |     generates base router flows
-           |     using od->lflow_ref, route_lflow_ref,
-           |     policy_lflow_ref
-           +-- lflow_ref_sync_lflows() x3
-           |     pushes new flows to SB
-           |
-           +-- NO full lflow recompute needed
+    if any input has state == EN_UPDATED:
+        if input has no handler (NULL):
+            RECOMPUTE this node     # full rebuild via run()
+        else:
+            call handler()
+            if handler returns false:
+                RECOMPUTE this node
+            else:
+                node stays as-is (handler updated it)
+    else:
+        node state = EN_UNCHANGED   # nothing to do
 ```
 
-### Engine Node DAG
+When recompute happens, the engine calls `clear_tracked_data()` first (to discard
+any partial tracking from handlers that ran before the failure), then calls
+`run()` for a full rebuild.
+
+### The Northd DAG
 
 ```
-                    NB Database Changes
-                    |               |
-          +---------+               +----------+
-          v                                    v
-  +----------------+                  +------------------+
-  | en_nb_logical_ |                  | en_nb_logical_   |
-  | router         |                  | router_port      |  <-- NEW (Phase C.2)
-  +----------------+                  +------------------+
-          |                                    |
-          v                                    v
-  +----------------+                  northd_nb_logical_
-  | northd_nb_     |                  router_port_handler()
-  | logical_router_|                  (add/delete incremental,
-  | handler()      |                   modify falls back)
-  +----------------+
-          |
-          v
-  +------------------------------------------------+
-  |              en_northd                          |
-  |                                                 |
-  |  northd_handle_lr_changes():                    |
-  |    is_new → INCREMENTAL (reject: disabled, DGW) |
-  |    is_deleted → goto fail (recompute)           |
-  |    modified + NAT/LB → existing handlers        |
-  |                                                 |
-  |  New inputs (NULL handlers = safe recompute):   |
-  |    en_nb_logical_router_static_route            |
-  |    en_nb_logical_router_policy                  |
-  |    en_nb_nat                                    |
-  +------------------------------------------------+
-          |
-          | NORTHD_TRACKED_LR_CREATED
-          v
-  +------------------------------------------------+
-  |              en_lflow                           |
-  |                                                 |
-  |  lflow_northd_handler():                        |
-  |    LR_CREATED → build + sync flows              |
-  |    LR_PORTS → build/resync per-LRP flows        |
-  |    LR_DELETED → return false (recompute)        |
-  |    else → existing incremental handlers         |
-  +------------------------------------------------+
-          |
-          v
-  +------------------------------------------------+
-  |  en_sync_to_sb, en_northd_output, etc.          |
-  +------------------------------------------------+
+  NB Tables                          SB Tables
+  ─────────                          ─────────
+  nb_logical_switch ──┐              sb_port_binding ──┐
+  nb_logical_router ──┤              sb_chassis ───────┤
+  nb_logical_router_port ─┤          sb_datapath_binding ─┤
+  nb_logical_router_      │          ...                │
+    static_route ─────────┤                             │
+  nb_logical_router_      │                             │
+    policy ───────────────┤                             │
+  nb_nat ─────────────────┤                             │
+  nb_load_balancer ──┐    │                             │
+  nb_load_balancer_  │    │                             │
+    group ───────────┤    │                             │
+  nb_acl ────────────┤    │                             │
+  nb_mirror ─────────┤    │                             │
+  ...                │    │                             │
+                     v    v                             v
+                  ┌──────────┐                   ┌──────────────┐
+                  │ lb_data  │                   │ global_config│
+                  └────┬─────┘                   └──────┬───────┘
+                       │                                │
+                       v                                v
+                  ┌──────────────────────────────────────────┐
+                  │              en_northd                    │
+                  │  Produces: datapaths, ports, LB maps     │
+                  │  Tracked: trk_created_lrs, trk_lrps,     │
+                  │           trk_lsps, trk_lbs, ...         │
+                  └───────────────────┬──────────────────────┘
+                                      │
+              ┌───────────────────────┼───────────────────────┐
+              v                       v                       v
+        ┌───────────┐          ┌────────────┐          ┌────────────┐
+        │ lr_nat    │          │ lr_stateful│          │ ls_stateful│
+        └─────┬─────┘          └──────┬─────┘          └──────┬─────┘
+              │                       │                       │
+              └───────────────────────┼───────────────────────┘
+                                      v
+                  ┌──────────────────────────────────────────┐
+                  │              en_lflow                     │
+                  │  Consumes tracked data from northd       │
+                  │  Generates/syncs Logical_Flow rows in SB │
+                  └───────────────────┬──────────────────────┘
+                                      │
+                                      v
+                  ┌──────────────────────────────────────────┐
+                  │         en_sync_to_sb                     │
+                  │         en_northd_output                  │
+                  └──────────────────────────────────────────┘
 ```
 
-### Incremental vs Recompute Behavior
+## 5. OVSDB IDL and Change Tracking
 
-| Operation | northd | lflow | Phase |
-|-----------|--------|-------|-------|
-| Router add (any config, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6+C.11.1 |
-| Router + ports + NAT + routes + policies + LB | **norecompute** | **norecompute** | C.6+C.5+C.7+C.11.1 |
-| LRP add on existing router (no DGW) | **norecompute** | **norecompute** | C.8+C.8.1 |
-| LRP delete on existing router (no DGW) | **norecompute** | **norecompute** | C.8+C.8.1 |
-| Router delete (with/without ports) | **norecompute** | recompute | C.10 |
-| Static route change | **norecompute** | **norecompute** | C.5 |
-| Policy change | **norecompute** | **norecompute** | C.7 |
-| NAT change | **norecompute** | recompute | Existing |
-| LB change | **norecompute** | **norecompute** | Existing |
-| LRP modify (MAC/IP change) | recompute | recompute | Fallback |
-| DGW port changes | recompute | recompute | Fallback |
-| Multi-router group deletion | recompute | recompute | Fallback |
-| Disabled router | recompute | recompute | Fallback |
+### How Database Changes Become Engine Inputs
 
-### Tunnel Key Allocation Strategy
+The OVSDB IDL (Interface Definition Language) layer provides automatic change
+tracking. northd enables it at startup:
 
-During full build, `build_datapaths()` maintains a `dp_tnlids` hmap of all used
-tunnel keys. This is a local variable not stored in `northd_data`.
-
-For incremental creation, we build a temporary set by scanning both `lr_datapaths`
-and `ls_datapaths` (tunnel keys must be unique across routers AND switches):
-
-```
-  Scan lr_datapaths.datapaths  →  collect used keys
-  Scan ls_datapaths.datapaths  →  collect used keys
-           |
-           v
-  ovn_datapath_assign_requested_tnl_id()  →  try "requested-tnl-key" option
-           |
-           v (if no requested key)
-  ovn_allocate_tnlid()  →  find first free key in [MIN_DP_KEY_LOCAL, max]
-           |
-           v
-  ovn_destroy_tnlids()  →  free temporary set
+```c
+ovsdb_idl_track_add_all(ovnnb_idl_loop.idl);
+ovsdb_idl_track_add_all(ovnsb_idl_loop.idl);
 ```
 
-### Fallback Strategy
+This tells the IDL to record which rows were inserted, deleted, or modified
+between iterations. The engine's leaf nodes (NB_NODE, SB_NODE) check these
+tracked changes in their `run()` function. If any tracked rows exist, the
+node state becomes `EN_UPDATED`, which triggers handlers in downstream nodes.
 
-Router creation in `northd_handle_lr_changes()` falls back to full recompute
-only for:
+### Iterating Tracked Changes
 
-- `!lrouter_is_enabled(changed_lr)` — disabled router
-- DGW ports (`ha_chassis_group` or `gateway_chassis` on any port)
+Handlers iterate only the rows that changed, not all rows:
 
-LBs, ports, NATs, routes, and policies on new routers are all handled
-incrementally. LB bitmaps are bulk-resized after new router creation via
-`ensure_lr_bitmap_size()` / `ensure_ls_bitmap_size()`.
-
-LRP add/delete on existing routers is handled incrementally by
-`northd_handle_lrp_changes()` with per-LRP lflow tracking via
-`tracked_lr_ports`. LRP modify (MAC/IP change) returns false (recompute).
-
-## 3. Engine Nodes for Router Sub-Tables (Phase C.2)
-
-Four new engine nodes detect changes to router sub-objects independently:
-
-| Engine Node | NB Table | Handler | Behavior |
-|-------------|----------|---------|----------|
-| `en_nb_logical_router_port` | Logical_Router_Port | `northd_nb_logical_router_port_handler` | Handles LRP add/delete incrementally; modify and DGW fall back |
-| `en_nb_logical_router_static_route` | Logical_Router_Static_Route | NULL | Any change → recompute |
-| `en_nb_logical_router_policy` | Logical_Router_Policy | NULL | Any change → recompute |
-| `en_nb_nat` | NAT | NULL | Any change → recompute |
-
-These nodes enable independent change detection. Previously, sub-object changes
-were only detected when the parent `Logical_Router` row's column changed. With
-dedicated nodes, the IDL tracks each sub-table independently via
-`nbrec_*_table_track_get_first()`.
-
-### Parent Lookup Strategy
-
-Sub-objects have no back-reference column to their parent router in the schema.
-Two lookup strategies are available:
-
-1. **`lr_ports` hmap** (used): `ovn_port_find(&nd->lr_ports, lrp->name)` → `op->od`
-2. **IDL `dst_arcs`** (not usable): `ovsdb_idl_arc` is private to `ovsdb-idl.c`
-
-## 4. Files Modified
-
-### OVS (`/ovs/`)
-
-| File | Change |
-|------|--------|
-| `lib/ovsdb-cs.h` | `OVSDB_CS_EVENT_TYPE_BINARY_UPDATE`, binary update structs, `#include ovsdb-data.h/ovsdb-types.h` |
-| `lib/ovsdb-cs.c` | Rewritten `ovsdb_cs_process_binary_row_batch()`, `ovsdb_cs_binary_db_update_destroy()`, event cleanup |
-| `lib/ovsdb-idl.c` | `ovsdb_idl_binary_row_change/insert_row/modify_row/process_binary_row_update/process_binary_update`, forward declarations |
-| `ovsdb/relay.c` | Handle new event type in switch |
-
-### OVN (`/ovn/`)
-
-| File | Change |
-|------|--------|
-| `northd/northd.h` | `NORTHD_TRACKED_LR_*` enums (CREATED, DELETED, ROUTES, POLICIES, LR_PORTS). `tracked_lr_ports` struct. Tracked data hmapx fields. Per-datapath `lflow_ref`, `route_lflow_ref`, `policy_lflow_ref`. `northd_handle_lrp_changes()` signature with txn + LRP table. |
-| `northd/lb.h` | `nb_lr_map_n_bits`/`nb_ls_map_n_bits` fields on `ovn_lb_datapaths`. `ensure_lr_bitmap_size()` / `ensure_ls_bitmap_size()` helpers for safe bitmap resize. |
-| `northd/lb.c` | Bitmap resize implementation with bulk resize of all LB bitmaps after new router creation. Doubling strategy for `ovn_lb_group_datapaths` `lr[]` arrays. |
-| `northd/northd.c` | `northd_handle_lr_changes()`: datapath materialization + inline port creation (C.6) + deletion with port cleanup (C.10) + LB association (C.11) + route/policy tracking. `northd_handle_lrp_changes()`: LRP add/delete on existing routers with parent lookup, port creation, SB binding, peer disconnect (C.8). `lr_changes_can_be_handled()`: allows COL_STATIC_ROUTES/POLICIES, removed LRP/route/policy seqno rejection. Per-datapath lflow_ref threaded through 16 flow builders. Public wrappers: `build_lr_flows_for_datapath()`, `build_lr_route_flows_for_datapath()`, `build_lr_policy_flows_for_datapath()`. Change detection: `is_lr_static_routes_changed()`, `is_lr_policies_changed()`. |
-| `northd/en-northd.h` | `northd_nb_logical_router_port_handler` declaration |
-| `northd/en-northd.c` | LR handler passes txn. LRP handler gets LRP table via `EN_OVSDB_GET`, passes txn + table to `northd_handle_lrp_changes()`. |
-| `northd/en-lflow.c` | `lflow_northd_handler()`: handles `LR_CREATED` (build + sync flows), `LR_ROUTES` (unlink + rebuild route flows), `LR_POLICIES` (unlink + rebuild policy flows), `LR_PORTS` (per-LRP flow build/resync via `lflow_handle_northd_lr_port_changes()`), `LR_DELETED` (falls back to lflow recompute) |
-| `northd/inc-proc-northd.c` | Four new NB_NODE entries (LRP, static_route, policy, NAT), DAG wiring with handlers |
-| `tests/ovn-northd.at` | 7 new tests + updated existing tests for incremental expectations |
-| `tests/perf-northd.at` | Binary transport performance test |
-| `Documentation/automake.mk` | New doc files in distribution |
-
-## 5. How Incremental Processing Works (Deep Dive)
-
-### 5.1 The Change Detection → Tracking → Rebuild → Sync Pipeline
-
-Every incremental update follows a four-stage pipeline:
-
-```
-Stage 1: DETECTION
-  IDL receives NB database update
-      ↓
-  ovsdb_idl_run() populates track lists
-      ↓
-  Engine input nodes check: _table_track_get_first()
-      ↓
-  If changes detected → set node state to EN_UPDATED
-
-Stage 2: TRACKING (in engine handler)
-  northd_handle_lr_changes() iterates tracked rows:
-      ↓
-  For each changed Logical_Router:
-    ├─ is_new? → create ovn_datapath → hmapx_add(trk_created_lrs)
-    ├─ is_deleted? → goto fail (recompute)
-    ├─ NAT changed? → hmapx_add(trk_nat_lrs)
-    ├─ routes changed? → hmapx_add(lr_with_changed_routes)
-    └─ policies changed? → hmapx_add(lr_with_changed_policies)
-      ↓
-  Set type flags: NORTHD_TRACKED_LR_CREATED | LR_ROUTES | LR_POLICIES
-      ↓
-  engine_set_node_state(node, EN_UPDATED)
-
-Stage 3: FLOW REBUILD (in downstream handler)
-  lflow_northd_handler() reads tracked data:
-      ↓
-  For NORTHD_TRACKED_LR_CREATED:
-    build_lr_flows_for_datapath(od, ...) → populates od->lflow_ref
-      ↓
-  For NORTHD_TRACKED_LR_ROUTES:
-    lflow_ref_unlink_lflows(od->route_lflow_ref) → marks old flows
-    build_lr_route_flows_for_datapath(od, ...) → populates new flows
-      ↓
-  For NORTHD_TRACKED_LR_POLICIES:
-    lflow_ref_unlink_lflows(od->policy_lflow_ref) → marks old flows
-    build_lr_policy_flows_for_datapath(od, ...) → populates new flows
-
-Stage 4: SB SYNC
-  lflow_ref_sync_lflows(od->lflow_ref, ...)
-      ↓
-  For each lflow_ref_node in the ref:
-    ├─ linked=true → sync_lflow_to_sb() (insert/update SB row)
-    └─ linked=false → delete SB row (if no other refs)
-      ↓
-  Transaction committed by ovsdb_idl_loop_commit_and_wait()
+```c
+/* Only iterates rows that were inserted, deleted, or modified */
+NBREC_LOGICAL_ROUTER_TABLE_FOR_EACH_TRACKED(changed_lr,
+                                              ni->nbrec_logical_router_table) {
+    if (nbrec_logical_router_is_new(changed_lr)) {
+        /* Row was inserted this iteration */
+    } else if (nbrec_logical_router_is_deleted(changed_lr)) {
+        /* Row was deleted this iteration */
+    } else {
+        /* Row was modified — check which columns changed */
+        if (nbrec_logical_router_is_updated(changed_lr,
+                NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES)) {
+            /* Static routes column changed */
+        }
+    }
+}
 ```
 
-### 5.2 The lflow_ref Reference Counting System
+This fine-grained change detection is what makes incremental processing possible.
+A handler can check exactly what changed and decide whether it can handle the
+change or needs to fall back to recompute.
 
-Each entity (port, LB, datapath) owns an `lflow_ref` that tracks which
-logical flows belong to it:
+### Accessing Tables in Handlers
+
+Engine handlers access OVSDB tables via `EN_OVSDB_GET`:
+
+```c
+const struct nbrec_logical_router_port_table *lrp_table =
+    EN_OVSDB_GET(engine_get_input("nb_logical_router_port", node));
+```
+
+This extracts the table pointer from the leaf node's data, giving the handler
+access to both the full table and its tracked changes.
+
+## 6. The lflow_ref System
+
+### Problem: Shared Flows and Datapath Groups
+
+Logical flows can be shared across multiple datapaths. For example, a default
+drop rule might apply to all 1,000 routers. In the SB database, this is stored
+once with a "datapath group" bitmap indicating which datapaths use it.
+
+When a single router is deleted, we need to remove it from the datapath group
+bitmap — but NOT delete the flow row, because 999 other routers still use it.
+We need reference counting.
+
+### How lflow_ref Works
+
+Each entity (datapath, port, load balancer) owns an `lflow_ref` that tracks
+which logical flows it generated:
 
 ```
                     Global lflow_table
@@ -431,14 +311,14 @@ logical flows belong to it:
                     │  priority=.. │          ▼
                     │  match=...   │    ┌──────────────┐
                     │  actions=... │    │ lflow_ref_node│───── in lflow_ref A
-                    │  dpg_bitmap  │    │  dp_index=3   │     (od->lflow_ref)
+                    │  dpg_bitmap  │    │  dp_index=3   │     (router3->lflow_ref)
                     └──────────────┘    │  linked=true  │
                                        └──────────────┘
                                              │
                                              ▼
                                        ┌──────────────┐
                                        │ lflow_ref_node│───── in lflow_ref B
-                                       │  dp_index=7   │     (other_od->lflow_ref)
+                                       │  dp_index=7   │     (router7->lflow_ref)
                                        │  linked=true  │
                                        └──────────────┘
 
@@ -448,121 +328,198 @@ logical flows belong to it:
   An lflow is deleted from SB only when ALL refs are unlinked.
 ```
 
-**Key operations:**
-- `lflow_table_add_lflow(... lflow_ref)` — creates lflow_ref_node if lflow_ref != NULL
-- `lflow_ref_unlink_lflows(ref)` — sets `linked=false` on all nodes (does NOT delete)
-- `lflow_ref_sync_lflows(ref, ...)` — syncs to SB: linked=true → insert/update, linked=false → delete
+### Key Operations
 
-### 5.3 Database Representation
+| Operation | What it does | When used |
+|-----------|-------------|-----------|
+| `lflow_table_add_lflow(... lflow_ref)` | Creates lflow + links to ref | Flow generation |
+| `lflow_ref_unlink_lflows(ref)` | Sets `linked=false` on all nodes | Before rebuilding flows |
+| `lflow_ref_sync_lflows(ref)` | Syncs to SB: linked→insert, unlinked→delete | After building new flows |
+| `lflow_ref_resync_flows(ref)` | Unlink + sync (for deletions) | Deleting an entity |
 
-**NB side (input):**
-```
-Logical_Router (nbrec_logical_router)
-  ├── ports[] → Logical_Router_Port (strong ref, separate table)
-  ├── nat[] → NAT (strong ref, separate table)
-  ├── static_routes[] → Logical_Router_Static_Route (strong ref)
-  ├── policies[] → Logical_Router_Policy (strong ref)
-  ├── load_balancer[] → Load_Balancer (weak ref)
-  └── options, name, enabled, copp, ...
-```
+The unlink/sync separation is important: unlinking marks flows for potential
+deletion, but the actual SB row is only deleted during sync if no other ref
+still links to it. This handles shared flows correctly.
 
-**SB side (output):**
-```
-Datapath_Binding (sbrec_datapath_binding)
-  ├── tunnel_key (uint32)
-  ├── external_ids: {logical-router: <UUID>, name: <name>}
-  └── (created by northd_handle_lr_changes for new routers)
+## 7. Per-Datapath lflow_ref Partitioning
 
-Port_Binding (sbrec_port_binding)
-  ├── logical_port (string)
-  ├── datapath (ref to Datapath_Binding)
-  ├── tunnel_key (uint32)
-  ├── type (patch, chassisredirect, l3gateway, ...)
-  ├── options: {peer, chassis-redirect-port, ...}
-  └── (created by ovn_port_update_sbrec for new LRPs)
-
-Logical_Flow (sbrec_logical_flow)
-  ├── logical_datapath (ref to Datapath_Binding)
-  ├── pipeline (ingress/egress)
-  ├── table_id (stage number)
-  ├── priority
-  ├── match, actions
-  └── (created by lflow_ref_sync_lflows)
-```
-
-### 5.4 The Engine DAG and Change Propagation
+Each router datapath has three separate `lflow_ref` fields that partition flows
+by concern:
 
 ```
-NB Database Tables
-  │
-  ├── en_nb_logical_router ──────────────────────────────────┐
-  │     Detects: new/deleted/modified router rows             │
-  │     Handler: northd_nb_logical_router_handler()           │
-  │                                                           │
-  ├── en_nb_logical_router_port ─────────────────────────┐   │
-  │     Detects: new/modified/deleted LRP rows            │   │
-  │     Handler: northd_nb_logical_router_port_handler()  │   │
-  │     (handles add/delete incrementally with per-LRP    │   │
-  │      lflow tracking; modify falls back to recompute)  │   │
-  │                                                       │   │
-  ├── en_nb_logical_router_static_route ─────────────┐   │   │
-  │     Detects: static route changes                 │   │   │
-  │     Handler: NULL (any change = recompute)        │   │   │
-  │                                                   │   │   │
-  ├── en_nb_logical_router_policy ───────────────┐   │   │   │
-  │     Detects: policy changes                   │   │   │   │
-  │     Handler: NULL (any change = recompute)    │   │   │   │
-  │                                               │   │   │   │
-  ├── en_nb_nat ─────────────────────────────┐   │   │   │   │
-  │     Detects: NAT row changes              │   │   │   │   │
-  │     Handler: NULL (any change = recompute)│   │   │   │   │
-  │                                           │   │   │   │   │
-  └── (other NB/SB inputs...)                 │   │   │   │   │
-                                              ▼   ▼   ▼   ▼   ▼
-                                     ┌────────────────────────────┐
-                                     │        en_northd           │
-                                     │  northd_handle_lr_changes()│
-                                     │  northd_handle_lrp_changes()
-                                     │                            │
-                                     │  Produces tracked data:    │
-                                     │  - trk_created_lrs         │
-                                     │  - trk_nat_lrs             │
-                                     │  - lr_with_changed_routes  │
-                                     │  - lr_with_changed_policies│
-                                     │  - trk_lrps (router ports) │
-                                     │  - trk_lsps (switch ports) │
-                                     │  - trk_lbs (load balancers)│
-                                     └────────────┬───────────────┘
-                                                  │ EN_UPDATED
-                                                  ▼
-                                     ┌────────────────────────────┐
-                                     │        en_lflow            │
-                                     │  lflow_northd_handler()    │
-                                     │                            │
-                                     │  Consumes tracked data:    │
-                                     │  - LR_CREATED → build flows│
-                                     │  - LR_ROUTES → rebuild rt  │
-                                     │  - LR_POLICIES → rebuild pl│
-                                     │  - LR_PORTS → build/resync │
-                                     │    port flows               │
-                                     │  - PORTS → rebuild port fl │
-                                     │  - LBS → rebuild lb flows  │
-                                     │  - LR_DELETED → return false
-                                     └────────────┬───────────────┘
-                                                  │ EN_UPDATED
-                                                  ▼
-                                     ┌────────────────────────────┐
-                                     │  en_sync_to_sb, en_northd_ │
-                                     │  output, en_lr_nat,        │
-                                     │  en_lr_stateful, ...       │
-                                     └────────────────────────────┘
-
-  When a handler returns false, the engine falls back to the node's
-  recompute function (en_northd_run / en_lflow_run), which rebuilds
-  everything from scratch.
+struct ovn_datapath {
+    lflow_ref ──────────────── General router flows (12 builders)
+    │                          adm_ctrl, neigh_learning, ND_RA,
+    │                          mcast_lookup, arp_resolve, check_pkt_len,
+    │                          gateway_redirect, arp_request, network_id,
+    │                          misc_local_traffic_drop, nat_defrag_lb,
+    │                          lb_affinity, default_drop
+    │
+    route_lflow_ref ─────────── Route-specific flows (2 builders)
+    │                          ip_routing_pre, static_route
+    │
+    policy_lflow_ref ────────── Policy-specific flows (1 builder)
+                               ingress_policy
+};
 ```
 
-### 5.5 Testing the Incremental Path
+When a static route changes on a router, only `route_lflow_ref` is unlinked
+and rebuilt. The general flows and policy flows are untouched. This reduces
+the work from O(all_flows_on_router) to O(route_flows_on_router).
+
+Each router port also has two `lflow_ref` fields:
+
+```
+struct ovn_port {
+    lflow_ref ──────────────── Per-port flows (10 builders)
+    │                          adm_ctrl, neigh_learning, ip_routing,
+    │                          ND_RA, arp_resolve, egress_delivery,
+    │                          dhcpv6_reply, ipv6_input, ipv4_input,
+    │                          icmp_packet_toobig
+    │
+    stateful_lflow_ref ──────── LB/NAT-related port flows
+                               lrp_lflows_for_lbnats,
+                               routable_flows_for_router_port
+};
+```
+
+## 8. Incremental Router Processing
+
+### The Complete Pipeline
+
+When a router is created in the NB database, the following pipeline executes:
+
+```
+NB Database: "lr-add lr_new -- lrp-add lr_new rp1 ... -- lr-lb-add lr_new lb1"
+                    │
+                    ▼
+    ┌───────────────────────────────────────────────────────────┐
+    │  OVSDB IDL: ovsdb_idl_run()                              │
+    │  Detects: Logical_Router inserted, LRP inserted,         │
+    │           LR.load_balancer column updated                │
+    │  Marks rows as tracked                                   │
+    └───────────────────────┬───────────────────────────────────┘
+                            │
+                            ▼
+    ┌───────────────────────────────────────────────────────────┐
+    │  Engine Leaf: en_nb_logical_router                        │
+    │  Checks: tracked rows exist? → YES → state = EN_UPDATED  │
+    └───────────────────────┬───────────────────────────────────┘
+                            │
+                            ▼
+    ┌───────────────────────────────────────────────────────────┐
+    │  Handler: northd_nb_logical_router_handler()              │
+    │           → northd_handle_lr_changes()                    │
+    │                                                           │
+    │  1. Reject if disabled or has DGW ports → goto fail       │
+    │  2. Create ovn_datapath, allocate tunnel key              │
+    │  3. Insert SB Datapath_Binding                            │
+    │  4. Resize ALL existing LB bitmaps to new size            │
+    │  5. For each LRP on the router:                           │
+    │     - Create ovn_port, parse networks                     │
+    │     - Allocate port tunnel key                            │
+    │     - Insert SB Port_Binding                              │
+    │  6. Associate LBs: ovn_lb_datapaths_add_lr() for each LB │
+    │  7. Track NATs/routes/policies if present                 │
+    │  8. Add to trk_created_lrs                                │
+    │  9. Set NORTHD_TRACKED_LR_CREATED | LR_ROUTES | ...      │
+    │                                                           │
+    │  Return: true (handled incrementally)                     │
+    └───────────────────────┬───────────────────────────────────┘
+                            │ EN_UPDATED (tracked data populated)
+                            ▼
+    ┌───────────────────────────────────────────────────────────┐
+    │  Handler: lflow_northd_handler()                          │
+    │                                                           │
+    │  Reads trk_created_lrs:                                   │
+    │    For each new router:                                   │
+    │      build_lr_flows_for_datapath(od)                      │
+    │        → generates ~50-100 flows using od->lflow_ref,     │
+    │          od->route_lflow_ref, od->policy_lflow_ref        │
+    │      lflow_ref_sync_lflows() × 3                          │
+    │        → inserts new Logical_Flow rows into SB            │
+    │                                                           │
+    │  Reads lr_with_changed_routes (if routes on new router):  │
+    │    build_lr_route_flows_for_datapath(od)                  │
+    │    lflow_ref_sync_lflows(od->route_lflow_ref)             │
+    │                                                           │
+    │  Return: true                                             │
+    └───────────────────────┬───────────────────────────────────┘
+                            │ EN_UPDATED
+                            ▼
+    ┌───────────────────────────────────────────────────────────┐
+    │  SB Transaction: ovsdb_idl_loop_commit_and_wait()         │
+    │  Writes: Datapath_Binding, Port_Binding, Logical_Flow     │
+    │  Existing routers: completely untouched                   │
+    └───────────────────────────────────────────────────────────┘
+```
+
+### LRP Add/Delete on Existing Routers
+
+When a port is added to an existing router (`lrp-add lr0 rp_new ...`):
+
+1. Engine leaf `en_nb_logical_router_port` detects the tracked LRP row
+2. `northd_handle_lrp_changes()` is called:
+   - Finds parent router by iterating `lr_datapaths` (O(routers × ports))
+   - Creates `ovn_port`, parses networks, allocates tunnel key
+   - Inserts SB `Port_Binding`
+   - Resolves peer LSP by scanning `ls_ports` for `options:router-port` match
+   - Sets bidirectional peer (`op->peer = lsp; lsp->peer = op`)
+   - Marks peer LSP as updated (its flows reference the new peer)
+   - Adds to `trk_lrps.created`, sets `NORTHD_TRACKED_LR_PORTS`
+3. `lflow_handle_northd_lr_port_changes()` generates per-LRP flows:
+   - `build_lswitch_and_lrouter_iterate_by_lrp(op)` → 10 flow builders
+   - `build_lbnat_lflows_iterate_by_lrp(op)` → LB/NAT port flows
+   - `lflow_ref_sync_lflows()` for both `op->lflow_ref` and `op->stateful_lflow_ref`
+
+For deleted LRPs, the port is removed from operational maps but kept alive.
+The lflow handler calls `lflow_ref_resync_flows()` which unlinks and syncs
+(deleting flows from SB). The port is then destroyed during
+`destroy_northd_data_tracked_changes()` at the end of the cycle.
+
+### Tracked Data Flow Between Nodes
+
+The `en_northd` node produces tracked data that downstream nodes consume:
+
+```
+northd_tracked_data {
+    type: bitmask of NORTHD_TRACKED_*
+    
+    trk_created_lrs    — new router datapaths (ovn_datapath *)
+    trk_deleted_lrs    — deleted router datapaths
+    trk_lrps.created   — new router ports (ovn_port *)
+    trk_lrps.deleted   — deleted router ports (kept alive for lflow cleanup)
+    trk_lsps           — switch port changes (created/updated/deleted)
+    trk_lbs            — load balancer changes
+    trk_nat_lrs        — routers with NAT changes
+    lr_with_changed_routes   — routers with static route changes
+    lr_with_changed_policies — routers with policy changes
+    ls_with_changed_lbs      — switches with LB changes
+    ls_with_changed_acls     — switches with ACL changes
+}
+```
+
+The lflow handler checks each flag and processes only the relevant tracked data.
+This is how change information propagates through the DAG without requiring
+full recomputation.
+
+### Fallback Conditions
+
+The incremental path falls back to full recompute for:
+
+| Condition | Why |
+|-----------|-----|
+| Disabled router (`!lrouter_is_enabled`) | Rare edge case, not worth optimizing |
+| DGW ports (`ha_chassis_group` or `gateway_chassis`) | Creates derived cr- port, affects `l3dgw_ports[]`, 40+ flow builders |
+| LRP modify (MAC/IP change) | Affects many flow builders (admission, routing, ARP resolution) |
+| Router deletion (lflow stage) | Datapath group membership cleanup is complex |
+| Multi-router group deletion | `lr_group` requires recursive rebuild across all members |
+
+Everything else is handled incrementally: router creation with ports, NATs,
+routes, policies, and LBs; LRP add/delete on existing routers; static route
+and policy changes; LB association changes.
+
+## 9. Testing the Incremental Path
 
 Tests use three mechanisms to verify incremental behavior:
 
@@ -600,34 +557,54 @@ check_row_count Datapath_Binding 3
 wait_row_count Port_Binding 1 logical_port=rp1
 ```
 
-### 5.6 Per-Datapath lflow_ref Threading
+## 10. Incremental Behavior Matrix
 
-The three `lflow_ref` fields on `struct ovn_datapath` partition flows
-by concern, enabling targeted rebuilds:
+| Operation | northd | lflow |
+|-----------|--------|-------|
+| Router add (any config, no DGW) | **norecompute** | **norecompute** |
+| Router + ports + NAT + routes + policies + LB | **norecompute** | **norecompute** |
+| LRP add on existing router (no DGW) | **norecompute** | **norecompute** |
+| LRP delete on existing router (no DGW) | **norecompute** | **norecompute** |
+| Router delete (with/without ports) | **norecompute** | recompute |
+| Static route change | **norecompute** | **norecompute** |
+| Policy change | **norecompute** | **norecompute** |
+| NAT change | **norecompute** | recompute |
+| LB change | **norecompute** | **norecompute** |
+| LRP modify (MAC/IP change) | recompute | recompute |
+| DGW port changes | recompute | recompute |
+| Multi-router group deletion | recompute | recompute |
+| Disabled router | recompute | recompute |
 
+## 11. NB/SB Database Representation
+
+**NB side (input):**
 ```
-struct ovn_datapath {
-    lflow_ref ──────────────── General router flows (12 builders)
-    │                          adm_ctrl, neigh_learning, ND_RA,
-    │                          mcast_lookup, arp_resolve, check_pkt_len,
-    │                          gateway_redirect, arp_request, network_id,
-    │                          misc_local_traffic_drop, nat_defrag_lb,
-    │                          lb_affinity, default_drop
-    │
-    route_lflow_ref ─────────── Route-specific flows (2 builders)
-    │                          ip_routing_pre, static_route
-    │
-    policy_lflow_ref ────────── Policy-specific flows (1 builder)
-                               ingress_policy
-};
-
-When a route changes:
-  Only route_lflow_ref is unlinked + rebuilt + synced.
-  lflow_ref and policy_lflow_ref are untouched.
-  → O(routes_on_this_router) instead of O(all_flows)
+Logical_Router (nbrec_logical_router)
+  ├── ports[] → Logical_Router_Port (strong ref, separate table)
+  ├── nat[] → NAT (strong ref, separate table)
+  ├── static_routes[] → Logical_Router_Static_Route (strong ref)
+  ├── policies[] → Logical_Router_Policy (strong ref)
+  ├── load_balancer[] → Load_Balancer (weak ref)
+  └── options, name, enabled, copp, ...
 ```
 
-## 6. Future Work
+**SB side (output):**
+```
+Datapath_Binding
+  ├── tunnel_key (uint32)
+  ├── external_ids: {logical-router: <UUID>, name: <name>}
+
+Port_Binding
+  ├── logical_port (string), datapath (ref), tunnel_key (uint32)
+  ├── type (patch, chassisredirect, l3gateway, ...)
+
+Logical_Flow
+  ├── logical_datapath (ref) or logical_dp_group (ref)
+  ├── pipeline (ingress/egress), table_id, priority
+  ├── match, actions
+```
+
+## 12. Future Work
 
 ### C.9: DGW Port Support (Tier 1 — New Routers Only)
 
