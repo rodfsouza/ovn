@@ -6,91 +6,45 @@
 |-------|--------|--------|-------|
 | **A** | **DONE** | OVS `aed87a9f7` | Direct binary→datum path. Eliminates JSON round-trip for ROW_BATCH. |
 | **B** | **DONE** | OVN `a4cd3936a` | Perf test in `tests/perf-northd.at`. |
-| **C.1** | **DONE** | OVN `b77f6cf93` | Datapath materialization for standalone routers. `northd norecompute`. |
+| **C.1** | **DONE** | OVN `b77f6cf93` | Datapath materialization for new routers. |
 | **C.2** | **DONE** | OVN `12c9051f5` | 4 new engine nodes (LRP, static_route, policy, NAT). |
-| **C.3** | **DONE** | OVN `12c9051f5` | LRP handler wired into DAG (returns false — safe fallback). |
-| **C.4** | **DONE** | OVN `7d413942f` | Per-datapath `lflow_ref` system. 3 refs per datapath threaded through 16 flow builders. Lflow generates flows incrementally for new routers. `northd + lflow norecompute`. |
-| **C.5** | **DONE** | OVN `7d413942f` | `is_lr_static_routes_changed()`, `lr_changes_can_be_handled()` extended. Per-router route flow rebuild via `od->route_lflow_ref`. `northd + lflow norecompute`. |
-| **C.6** | **DONE** | OVN `4987eb03c` | Router + ports in same txn. Inline LRP creation with `ovn_port_create()` + `ovn_port_update_sbrec()`. DGW/LB ports fall back. `northd norecompute`. |
-| **C.7** | **DONE** | OVN `7d413942f` | `is_lr_policies_changed()`, per-router policy flow rebuild via `od->policy_lflow_ref`. `northd + lflow norecompute`. |
-| **C.del** | **DONE** | OVN `4987eb03c` | Standalone router deletion. Clears lflow_refs, deletes SB datapath_binding, destroys ovn_datapath. Routers with ports/lr_group fall back. `northd norecompute + lflow recompute`. |
+| **C.3** | **DONE** | OVN `12c9051f5` | LRP handler wired into DAG. |
+| **C.4** | **DONE** | OVN `7d413942f` | Per-datapath `lflow_ref` (3 refs × 16 builders). Incremental lflow gen for new routers. |
+| **C.5** | **DONE** | OVN `7d413942f` | Incremental static route handling via `od->route_lflow_ref`. |
+| **C.6** | **DONE** | OVN `4987eb03c` | Router + ports in same txn. Inline LRP creation. |
+| **C.7** | **DONE** | OVN `7d413942f` | Incremental policy handling via `od->policy_lflow_ref`. |
+| **C.8** | **DONE** | OVN `69da4c94b` | LRP add/delete on existing routers. Parent lookup via `lr_datapaths` iteration. Reject DGW/modify. |
+| **C.10** | **DONE** | OVN `69da4c94b` | Router deletion with ports. Iterates `od->ports`, cleans cr_port/peer/SB. Single-member `lr_group` cleanup. |
+| **C.11** | **DONE** | OVN `69da4c94b` | LB on new router via `ovn_lb_datapaths_add_lr()`. LB groups via `ovn_lb_group_datapaths_add_lr()`. |
+| **C.9** | NOT STARTED | — | DGW Tier 1 — cr- port on new routers. |
 | **D** | NOT STARTED | — | Binary UPDATE_BATCH with direct datum path. XOR support needed. |
 | **E** | NOT STARTED | — | Streaming-aware batch processing. |
 
 ### Current Incremental Behavior
 
-| Operation | northd | lflow | Status |
-|-----------|--------|-------|--------|
-| Standalone router add | **norecompute** | **norecompute** | C.1 + C.4 |
-| Router + ports (no DGW) | **norecompute** | **norecompute** | C.6 |
-| Router + ports + NAT | **norecompute** | **norecompute** | C.6 |
-| Router + ports + routes | **norecompute** | **norecompute** | C.6 + C.5 |
+| Operation | northd | lflow | Phase |
+|-----------|--------|-------|-------|
+| Router add (any config, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6+C.11 |
+| Router + ports + NAT + routes + policies + LB | **norecompute** | **norecompute** | C.6+C.5+C.7+C.11 |
+| LRP add on existing router (no DGW) | **norecompute** | recompute | C.8 |
+| LRP delete on existing router (no DGW) | **norecompute** | recompute | C.8 |
+| Router delete (with/without ports) | **norecompute** | recompute | C.10 |
 | Static route change | **norecompute** | **norecompute** | C.5 |
 | Policy change | **norecompute** | **norecompute** | C.7 |
-| NAT change | **norecompute** | recompute | Existing (pre-C.4) |
+| NAT change | **norecompute** | recompute | Existing |
 | LB change | **norecompute** | **norecompute** | Existing |
-| Standalone router delete | **norecompute** | recompute | C.del |
-| LRP add/modify/delete | recompute | recompute | LRP handler returns false |
-| Router + DGW ports | recompute | recompute | DGW fallback |
-| Router + LB (same txn) | recompute | recompute | LB fallback |
-| Router delete with ports | recompute | recompute | Ports/lr_group fallback |
-
-### Planned Phases (C.8-C.11)
-
-| Phase | Description | Complexity | Prerequisite |
-|-------|-------------|------------|--------------|
-| **C.11** | LB on new router — `ovn_lb_datapaths_add_lr()` | Low | None |
-| **C.8** | LRP add/delete on existing routers | Medium | None |
-| **C.10** | Router deletion with ports | Medium | C.8 (same cleanup pattern) |
-| **C.9** | DGW Tier 1 — cr- port on new routers only | High | C.8 |
-
-**Recommended order**: C.11 → C.8 → C.10 → C.9
-
-### C.8: LRP Add/Delete on Existing Routers
-
-- **Parent lookup**: Iterate `lr_datapaths` × `nbr->ports[]` to find parent router (O(R×P), R is small)
-- **New LRP**: `ovn_port_create()` + `extract_lrp_networks()` + `ovn_port_allocate_key()` + `ovn_port_update_sbrec()`. Reject DGW ports.
-- **Deleted LRP**: `lflow_ref_clear()` + `sbrec_port_binding_delete()` + `hmap_remove()` + `ovn_port_destroy_orphan()`. Reject if has `cr_port`.
-- **Modified LRP**: Falls back to recompute (MAC/IP changes affect many builders)
-- **Peer port**: Find peer LSP in `ls_ports`, set bidirectional `op->peer`, mark peer as updated in `trk_lsps`
-- **Lflow handler**: `build_lswitch_and_lrouter_iterate_by_lrp()` + `lflow_ref_sync_lflows(op->lflow_ref)` for created; `lflow_ref_resync_flows()` for deleted
-
-### C.9: DGW Port Support (Tier 1 — New Routers Only)
-
-- Remove DGW fallback in C.6 for new router creation
-- Create cr- port via `ovn_chassis_redirect_name()` + `ovn_port_create()`
-- Set `crp->primary_port = op; op->cr_port = crp; crp->od = od`
-- Add to `od->l3dgw_ports[]` array
-- Insert SB `port_binding` for cr- port
-- DGW on existing routers remains fallback
-
-### C.10: Router Deletion with Ports
-
-- Extend current deletion code to handle `!hmap_is_empty(&od->ports)`
-- Iterate `HMAP_FOR_EACH_SAFE(op, dp_node, &od->ports)`:
-  - Clean cr_port if exists (lflow_ref_clear + SB delete + destroy)
-  - Disconnect peer (`op->peer->peer = NULL`)
-  - `lflow_ref_clear()` + SB port_binding delete + hmap_remove + destroy orphan
-- Clean single-member `lr_group`
-- Fall back if `lr_group->n_router_dps > 1` (multi-router group)
-
-### C.11: LB on New Router
-
-- Remove `n_load_balancer > 0` fallback
-- Iterate `changed_lr->load_balancer[]`:
-  - Find existing `ovn_lb_datapaths` via `ovn_lb_datapaths_find()`
-  - Call `ovn_lb_datapaths_add_lr(lb_dps, 1, &od)` to add router to bitmap
-  - Track in `trk_lbs.crupdated` + set `NORTHD_TRACKED_LBS`
-- LB groups: same pattern via `ovn_lb_group_datapaths_find()` + iterate group's LBs
-- Reuses existing incremental LB lflow handler
+| LRP modify (MAC/IP change) | recompute | recompute | Fallback |
+| DGW port changes | recompute | recompute | Fallback |
+| Multi-router group deletion | recompute | recompute | Fallback |
+| Disabled router | recompute | recompute | Fallback |
 
 ### Remaining Future Work
 
-1. **LRP modify** on existing routers: Falls back (MAC/IP changes complex)
-2. **DGW on existing routers** (C.9 Tier 2): Full `create_cr_port()` in LRP handler
-3. **Multi-router group deletion**: `lr_group->n_router_dps > 1` requires recursive group rebuild
-4. **Binary XOR** (Phase D): `ovsdb_datum_apply_diff_in_place()` support
-5. **Batch accumulation** (Phase E): Accumulate binary frames before `engine_run()`
+1. **C.9 — DGW Tier 1**: Create cr- port on new routers via `ovn_chassis_redirect_name()` + `ovn_port_create()`. Populate `od->l3dgw_ports[]`. DGW on existing routers remains fallback.
+2. **LRP modify**: MAC/IP changes affect many flow builders — complex to handle incrementally.
+3. **Multi-router group deletion**: `lr_group->n_router_dps > 1` requires recursive group rebuild.
+4. **Binary XOR** (Phase D): `ovsdb_datum_apply_diff_in_place()` support.
+5. **Batch accumulation** (Phase E): Accumulate binary frames before `engine_run()`.
 
 ---
 

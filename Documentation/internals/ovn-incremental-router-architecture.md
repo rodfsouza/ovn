@@ -251,20 +251,20 @@ AFTER:
 
 ### Incremental vs Recompute Behavior
 
-| Operation | northd | lflow | Commit |
-|-----------|--------|-------|--------|
-| Standalone router add | **norecompute** | **norecompute** | C.1+C.4 |
-| Router + ports (no DGW) | **norecompute** | **norecompute** | C.6 |
-| Router + ports + NAT | **norecompute** | **norecompute** | C.6 |
-| Standalone router delete | **norecompute** | recompute | C.del |
+| Operation | northd | lflow | Phase |
+|-----------|--------|-------|-------|
+| Router add (any config, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6+C.11 |
+| Router + ports + NAT + routes + policies + LB | **norecompute** | **norecompute** | C.6+C.5+C.7+C.11 |
+| LRP add on existing router (no DGW) | **norecompute** | recompute | C.8 |
+| LRP delete on existing router (no DGW) | **norecompute** | recompute | C.8 |
+| Router delete (with/without ports) | **norecompute** | recompute | C.10 |
 | Static route change | **norecompute** | **norecompute** | C.5 |
 | Policy change | **norecompute** | **norecompute** | C.7 |
 | NAT modify (existing) | **norecompute** | recompute | Existing |
 | LB modify (existing) | **norecompute** | **norecompute** | Existing |
-| LRP add/modify/delete | recompute | recompute | TODO |
-| Router + DGW ports | recompute | recompute | Fallback |
-| Router + LB (same txn) | recompute | recompute | Fallback |
-| Router delete with ports | recompute | recompute | Fallback |
+| LRP modify (MAC/IP change) | recompute | recompute | Fallback |
+| DGW port changes | recompute | recompute | Fallback |
+| Multi-router group deletion | recompute | recompute | Fallback |
 
 ### Tunnel Key Allocation Strategy
 
@@ -342,10 +342,10 @@ Two lookup strategies are available:
 
 | File | Change |
 |------|--------|
-| `northd/northd.h` | `NORTHD_TRACKED_LR_*` enums (CREATED, DELETED, ROUTES, POLICIES). `trk_created_lrs`, `trk_deleted_lrs`, `lr_with_changed_routes`, `lr_with_changed_policies` hmapx. Per-datapath `lflow_ref`, `route_lflow_ref`, `policy_lflow_ref`. |
-| `northd/northd.c` | `northd_handle_lr_changes()`: datapath materialization + inline port creation (C.6) + standalone deletion + route/policy tracking. `northd_handle_lrp_changes()`: returns false. `lr_changes_can_be_handled()`: allows COL_STATIC_ROUTES/POLICIES. Per-datapath lflow_ref threaded through 16 flow builders. Public wrappers: `build_lr_flows_for_datapath()`, `build_lr_route_flows_for_datapath()`, `build_lr_policy_flows_for_datapath()`. Change detection: `is_lr_static_routes_changed()`, `is_lr_policies_changed()`. |
+| `northd/northd.h` | `NORTHD_TRACKED_LR_*` enums (CREATED, DELETED, ROUTES, POLICIES). Tracked data hmapx fields. Per-datapath `lflow_ref`, `route_lflow_ref`, `policy_lflow_ref`. `northd_handle_lrp_changes()` signature with txn + LRP table. |
+| `northd/northd.c` | `northd_handle_lr_changes()`: datapath materialization + inline port creation (C.6) + deletion with port cleanup (C.10) + LB association (C.11) + route/policy tracking. `northd_handle_lrp_changes()`: LRP add/delete on existing routers with parent lookup, port creation, SB binding, peer disconnect (C.8). `lr_changes_can_be_handled()`: allows COL_STATIC_ROUTES/POLICIES, removed LRP/route/policy seqno rejection. Per-datapath lflow_ref threaded through 16 flow builders. Public wrappers: `build_lr_flows_for_datapath()`, `build_lr_route_flows_for_datapath()`, `build_lr_policy_flows_for_datapath()`. Change detection: `is_lr_static_routes_changed()`, `is_lr_policies_changed()`. |
 | `northd/en-northd.h` | `northd_nb_logical_router_port_handler` declaration |
-| `northd/en-northd.c` | LR handler passes txn, LRP handler calls `northd_handle_lrp_changes()` |
+| `northd/en-northd.c` | LR handler passes txn. LRP handler gets LRP table via `EN_OVSDB_GET`, passes txn + table to `northd_handle_lrp_changes()`. |
 | `northd/en-lflow.c` | `lflow_northd_handler()`: handles `LR_CREATED` (build + sync flows), `LR_ROUTES` (unlink + rebuild route flows), `LR_POLICIES` (unlink + rebuild policy flows), `LR_DELETED` (falls back to lflow recompute) |
 | `northd/inc-proc-northd.c` | Four new NB_NODE entries (LRP, static_route, policy, NAT), DAG wiring with handlers |
 | `tests/ovn-northd.at` | 7 new tests + updated existing tests for incremental expectations |
@@ -617,30 +617,26 @@ When a route changes:
 
 ## 6. Future Work
 
-### LRP Add/Modify/Delete on Existing Routers
+### C.9: DGW Port Support (Tier 1 — New Routers Only)
 
-The `en_nb_logical_router_port` handler currently returns false.
-Full implementation needs:
-- Port lookup via `ovn_port_find(&nd->lr_ports, lrp->name)`
-- Parent router via `op->od`
-- `ovn_port_create()` + `extract_lrp_networks()` for new ports
-- `ovn_port_update_sbrec()` for SB port_binding
-- `build_lswitch_and_lrouter_iterate_by_lrp()` for per-LRP flows
-- Peer port bidirectional linking
-- DGW port fallback (create_cr_port is complex)
+Create cr- port on new routers via `ovn_chassis_redirect_name()` +
+`ovn_port_create()`. Set `crp->primary_port = op; op->cr_port = crp`.
+Populate `od->l3dgw_ports[]`. Insert SB port_binding for cr- port.
+DGW on existing routers remains fallback due to complexity of
+HA chassis group handling and 40+ downstream flow generation sites.
 
-### Router Deletion with Ports
+### LRP Modify on Existing Routers
 
-Current deletion handles standalone routers only. Routers with ports
-need: iterate `od->ports`, delete each port's SB `port_binding`,
-unlink per-port `lflow_ref`, clean `lr_group` back-references from
-all member routers.
+MAC/IP changes affect many flow builders (admission control, routing,
+ARP resolution, etc.). Requires unlink+rebuild of all per-LRP flows
+and possibly per-datapath flows. Complex due to peer port flow
+regeneration requirements.
 
-### Load Balancer on New Router
+### Multi-Router Group Deletion
 
-`build_lb_datapaths()` associates LBs with routers during full build.
-Not yet called incrementally. Router creation with `n_load_balancer > 0`
-falls back to recompute.
+When `lr_group->n_router_dps > 1`, deleting a router requires
+rebuilding the group recursively via `build_lrouter_groups__()` for
+all remaining members. Falls back to full recompute.
 
 ### Binary UPDATE_BATCH (Phase D)
 
