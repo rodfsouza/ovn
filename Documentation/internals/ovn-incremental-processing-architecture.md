@@ -158,8 +158,8 @@ At scale (1,000+ routers), this rebuilds hundreds of thousands of flows.
 
 ### Solution
 
-Standalone router creation (no ports, NATs, LBs, policies, or static routes)
-is handled incrementally — only the new router's datapath is created:
+Router creation with any configuration (ports, NATs, LBs, routes, policies)
+is handled incrementally — only the new router's datapath and flows are created:
 
 ```
 AFTER:
@@ -170,7 +170,7 @@ AFTER:
   northd_handle_lr_changes()
        |
        +-- nbrec_logical_router_is_new() == true
-       +-- reject only: LB, disabled, DGW ports
+       +-- reject only: disabled, DGW ports
        |
        +-- INCREMENTAL:
            |
@@ -216,8 +216,8 @@ AFTER:
           v                                    v
   +----------------+                  northd_nb_logical_
   | northd_nb_     |                  router_port_handler()
-  | logical_router_|                  (returns false =
-  | handler()      |                   safe recompute)
+  | logical_router_|                  (add/delete incremental,
+  | handler()      |                   modify falls back)
   +----------------+
           |
           v
@@ -225,8 +225,7 @@ AFTER:
   |              en_northd                          |
   |                                                 |
   |  northd_handle_lr_changes():                    |
-  |    is_new + standalone → INCREMENTAL            |
-  |    is_new + ports/NATs → goto fail (recompute)  |
+  |    is_new → INCREMENTAL (reject: disabled, DGW) |
   |    is_deleted → goto fail (recompute)           |
   |    modified + NAT/LB → existing handlers        |
   |                                                 |
@@ -242,7 +241,9 @@ AFTER:
   |              en_lflow                           |
   |                                                 |
   |  lflow_northd_handler():                        |
-  |    if LR_CREATED → return false (recompute)     |
+  |    LR_CREATED → build + sync flows              |
+  |    LR_PORTS → build/resync per-LRP flows        |
+  |    LR_DELETED → return false (recompute)        |
   |    else → existing incremental handlers         |
   +------------------------------------------------+
           |
@@ -254,21 +255,21 @@ AFTER:
 
 ### Incremental vs Recompute Behavior
 
-| Operation | northd | lflow | Phase | Notes |
-|-----------|--------|-------|-------|-------|
-| Router add (no LB, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6 | |
-| Router + ports + NAT + routes + policies | **norecompute** | **norecompute** | C.6+C.5+C.7 | |
-| Router + LB | recompute | recompute | C.11 reverted | Bitmap OOB — needs C.11.1 |
-| LRP add on existing router (no DGW) | recompute | recompute | C.8 partial | Creates port+SB, returns false — needs C.8.1 |
-| LRP delete on existing router (no DGW) | recompute | recompute | C.8 partial | Deletes port+SB, returns false — needs C.8.1 |
-| Router delete (with/without ports) | **norecompute** | recompute | C.10 | Lflow returns false (future: keep OD alive for resync) |
-| Static route change | **norecompute** | **norecompute** | C.5 | |
-| Policy change | **norecompute** | **norecompute** | C.7 | |
-| NAT modify (existing) | **norecompute** | recompute | Existing | |
-| LB modify (existing) | **norecompute** | **norecompute** | Existing | |
-| LRP modify (MAC/IP change) | recompute | recompute | Fallback | |
-| DGW port changes | recompute | recompute | Fallback | |
-| Multi-router group deletion | recompute | recompute | Fallback | |
+| Operation | northd | lflow | Phase |
+|-----------|--------|-------|-------|
+| Router add (any config, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6+C.11.1 |
+| Router + ports + NAT + routes + policies + LB | **norecompute** | **norecompute** | C.6+C.5+C.7+C.11.1 |
+| LRP add on existing router (no DGW) | **norecompute** | **norecompute** | C.8+C.8.1 |
+| LRP delete on existing router (no DGW) | **norecompute** | **norecompute** | C.8+C.8.1 |
+| Router delete (with/without ports) | **norecompute** | recompute | C.10 |
+| Static route change | **norecompute** | **norecompute** | C.5 |
+| Policy change | **norecompute** | **norecompute** | C.7 |
+| NAT change | **norecompute** | recompute | Existing |
+| LB change | **norecompute** | **norecompute** | Existing |
+| LRP modify (MAC/IP change) | recompute | recompute | Fallback |
+| DGW port changes | recompute | recompute | Fallback |
+| Multi-router group deletion | recompute | recompute | Fallback |
+| Disabled router | recompute | recompute | Fallback |
 
 ### Tunnel Key Allocation Strategy
 
@@ -294,21 +295,19 @@ and `ls_datapaths` (tunnel keys must be unique across routers AND switches):
 
 ### Fallback Strategy
 
-Router creation falls back to full recompute only for:
+Router creation in `northd_handle_lr_changes()` falls back to full recompute
+only for:
 
-```c
-if (changed_lr->n_load_balancer > 0      // LB bitmap OOB (C.11 reverted)
-    || changed_lr->n_load_balancer_group > 0  // Same issue
-    || !lrouter_is_enabled(changed_lr)   // Disabled router
-    || has_dgw_ports(changed_lr)) {      // DGW ports (complex cr- creation)
-    goto fail;  // Full recompute — safe, correct
-}
-```
+- `!lrouter_is_enabled(changed_lr)` — disabled router
+- DGW ports (`ha_chassis_group` or `gateway_chassis` on any port)
 
-Ports, NATs, routes, and policies on new routers are handled incrementally.
-LRP add/delete on existing routers creates/deletes the port and SB binding
-incrementally but then returns false to trigger lflow recompute (per-LRP
-lflow tracking is not yet implemented — planned in C.8.1).
+LBs, ports, NATs, routes, and policies on new routers are all handled
+incrementally. LB bitmaps are bulk-resized after new router creation via
+`ensure_lr_bitmap_size()` / `ensure_ls_bitmap_size()`.
+
+LRP add/delete on existing routers is handled incrementally by
+`northd_handle_lrp_changes()` with per-LRP lflow tracking via
+`tracked_lr_ports`. LRP modify (MAC/IP change) returns false (recompute).
 
 ## 3. Engine Nodes for Router Sub-Tables (Phase C.2)
 
@@ -316,7 +315,7 @@ Four new engine nodes detect changes to router sub-objects independently:
 
 | Engine Node | NB Table | Handler | Behavior |
 |-------------|----------|---------|----------|
-| `en_nb_logical_router_port` | Logical_Router_Port | `northd_nb_logical_router_port_handler` | Returns false (recompute) |
+| `en_nb_logical_router_port` | Logical_Router_Port | `northd_nb_logical_router_port_handler` | Handles LRP add/delete incrementally; modify and DGW fall back |
 | `en_nb_logical_router_static_route` | Logical_Router_Static_Route | NULL | Any change → recompute |
 | `en_nb_logical_router_policy` | Logical_Router_Policy | NULL | Any change → recompute |
 | `en_nb_nat` | NAT | NULL | Any change → recompute |
@@ -349,11 +348,13 @@ Two lookup strategies are available:
 
 | File | Change |
 |------|--------|
-| `northd/northd.h` | `NORTHD_TRACKED_LR_*` enums (CREATED, DELETED, ROUTES, POLICIES). Tracked data hmapx fields. Per-datapath `lflow_ref`, `route_lflow_ref`, `policy_lflow_ref`. `northd_handle_lrp_changes()` signature with txn + LRP table. |
+| `northd/northd.h` | `NORTHD_TRACKED_LR_*` enums (CREATED, DELETED, ROUTES, POLICIES, LR_PORTS). `tracked_lr_ports` struct. Tracked data hmapx fields. Per-datapath `lflow_ref`, `route_lflow_ref`, `policy_lflow_ref`. `northd_handle_lrp_changes()` signature with txn + LRP table. |
+| `northd/lb.h` | `nb_lr_map_n_bits`/`nb_ls_map_n_bits` fields on `ovn_lb_datapaths`. `ensure_lr_bitmap_size()` / `ensure_ls_bitmap_size()` helpers for safe bitmap resize. |
+| `northd/lb.c` | Bitmap resize implementation with bulk resize of all LB bitmaps after new router creation. Doubling strategy for `ovn_lb_group_datapaths` `lr[]` arrays. |
 | `northd/northd.c` | `northd_handle_lr_changes()`: datapath materialization + inline port creation (C.6) + deletion with port cleanup (C.10) + LB association (C.11) + route/policy tracking. `northd_handle_lrp_changes()`: LRP add/delete on existing routers with parent lookup, port creation, SB binding, peer disconnect (C.8). `lr_changes_can_be_handled()`: allows COL_STATIC_ROUTES/POLICIES, removed LRP/route/policy seqno rejection. Per-datapath lflow_ref threaded through 16 flow builders. Public wrappers: `build_lr_flows_for_datapath()`, `build_lr_route_flows_for_datapath()`, `build_lr_policy_flows_for_datapath()`. Change detection: `is_lr_static_routes_changed()`, `is_lr_policies_changed()`. |
 | `northd/en-northd.h` | `northd_nb_logical_router_port_handler` declaration |
 | `northd/en-northd.c` | LR handler passes txn. LRP handler gets LRP table via `EN_OVSDB_GET`, passes txn + table to `northd_handle_lrp_changes()`. |
-| `northd/en-lflow.c` | `lflow_northd_handler()`: handles `LR_CREATED` (build + sync flows), `LR_ROUTES` (unlink + rebuild route flows), `LR_POLICIES` (unlink + rebuild policy flows), `LR_DELETED` (falls back to lflow recompute) |
+| `northd/en-lflow.c` | `lflow_northd_handler()`: handles `LR_CREATED` (build + sync flows), `LR_ROUTES` (unlink + rebuild route flows), `LR_POLICIES` (unlink + rebuild policy flows), `LR_PORTS` (per-LRP flow build/resync via `lflow_handle_northd_lr_port_changes()`), `LR_DELETED` (falls back to lflow recompute) |
 | `northd/inc-proc-northd.c` | Four new NB_NODE entries (LRP, static_route, policy, NAT), DAG wiring with handlers |
 | `tests/ovn-northd.at` | 7 new tests + updated existing tests for incremental expectations |
 | `tests/perf-northd.at` | Binary transport performance test |
@@ -501,7 +502,8 @@ NB Database Tables
   ├── en_nb_logical_router_port ─────────────────────────┐   │
   │     Detects: new/modified/deleted LRP rows            │   │
   │     Handler: northd_nb_logical_router_port_handler()  │   │
-  │     (currently returns false = recompute)              │   │
+  │     (handles add/delete incrementally with per-LRP    │   │
+  │      lflow tracking; modify falls back to recompute)  │   │
   │                                                       │   │
   ├── en_nb_logical_router_static_route ─────────────┐   │   │
   │     Detects: static route changes                 │   │   │
@@ -527,6 +529,7 @@ NB Database Tables
                                      │  - trk_nat_lrs             │
                                      │  - lr_with_changed_routes  │
                                      │  - lr_with_changed_policies│
+                                     │  - trk_lrps (router ports) │
                                      │  - trk_lsps (switch ports) │
                                      │  - trk_lbs (load balancers)│
                                      └────────────┬───────────────┘
@@ -540,6 +543,8 @@ NB Database Tables
                                      │  - LR_CREATED → build flows│
                                      │  - LR_ROUTES → rebuild rt  │
                                      │  - LR_POLICIES → rebuild pl│
+                                     │  - LR_PORTS → build/resync │
+                                     │    port flows               │
                                      │  - PORTS → rebuild port fl │
                                      │  - LBS → rebuild lb flows  │
                                      │  - LR_DELETED → return false
@@ -623,36 +628,6 @@ When a route changes:
 ```
 
 ## 6. Future Work
-
-### C.11.1: LB Bitmap Resize (Next)
-
-**Problem**: `ovn_lb_datapaths.nb_lr_map` allocated with old router count.
-When a new router is created incrementally, `od->index` can exceed the bitmap
-boundary, causing OOB write in `bitmap_set1()`.
-
-**Fix**: Add `nb_lr_map_n_bits` field to `struct ovn_lb_datapaths`. In
-`ovn_lb_datapaths_add_lr()`, check `ods[i]->index >= lb_dps->nb_lr_map_n_bits`
-and `xrealloc` + `memset` the bitmap to the new size. Same pattern for
-`ovn_lb_group_datapaths` (add `max_lr` field, realloc `lr[]` array).
-
-Then restore the LB association block in `northd_handle_lr_changes()` and
-remove the `n_load_balancer > 0` fallback.
-
-### C.8.1: Per-LRP Incremental Lflow Tracking (Next)
-
-**Problem**: LRP create/delete handler creates/deletes the port and SB
-port_binding correctly but returns false to trigger full lflow recompute,
-because per-LRP lflow tracking was not implemented.
-
-**Fix**: Follow the `tracked_ovn_ports` (LSP) pattern:
-1. Add `tracked_lr_ports` struct with `created`/`deleted` hmapx fields
-2. Add `NORTHD_TRACKED_LR_PORTS` enum value (1 << 9)
-3. LRP create: resolve peer LSP via `ls_ports` scan, add to `trk_lrps.created`
-4. LRP delete: keep port alive (don't destroy), add to `trk_lrps.deleted`
-5. Lflow handler: for created, call `build_lswitch_and_lrouter_iterate_by_lrp()`
-   + `build_lbnat_lflows_iterate_by_lrp()` + sync both `lflow_ref` and
-   `stateful_lflow_ref`. For deleted, call `lflow_ref_resync_flows()` on both refs.
-6. Port destroyed in `destroy_northd_data_tracked_changes()` (same as LSP pattern)
 
 ### C.9: DGW Port Support (Tier 1 — New Routers Only)
 
