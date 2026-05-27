@@ -82,6 +82,8 @@ static const char *rbac_chassis_private_auth[] =
 static const char *rbac_chassis_private_update[] =
     {"nb_cfg", "nb_cfg_timestamp", "chassis", "external_ids"};
 
+static bool use_binary_transport = true;
+
 static const char *rbac_encap_auth[] =
     {"chassis_name"};
 static const char *rbac_encap_update[] =
@@ -591,6 +593,7 @@ Options:\n\
                             (default: %s)\n\
   --dry-run                 start in paused state (do not commit db changes)\n\
   --n-threads=N             specify number of threads\n\
+  --no-binary-transport     disable binary format for OVSDB connections\n\
   --unixctl=SOCKET          override default control socket name\n\
   -h, --help                display this help message\n\
   -o, --options             list available options\n\
@@ -611,6 +614,7 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED,
         SSL_OPTION_ENUMS,
         OPT_DRY_RUN,
         OPT_N_THREADS,
+        OPT_NO_BINARY_TRANSPORT,
     };
     static const struct option long_options[] = {
         {"ovnsb-db", required_argument, NULL, 'd'},
@@ -621,6 +625,7 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED,
         {"version", no_argument, NULL, 'V'},
         {"dry-run", no_argument, NULL, OPT_DRY_RUN},
         {"n-threads", required_argument, NULL, OPT_N_THREADS},
+        {"no-binary-transport", no_argument, NULL, OPT_NO_BINARY_TRANSPORT},
         OVN_DAEMON_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
@@ -703,6 +708,10 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED,
 
         case OPT_DRY_RUN:
             *paused = true;
+            break;
+
+        case OPT_NO_BINARY_TRANSPORT:
+            use_binary_transport = false;
             break;
 
         default:
@@ -853,6 +862,7 @@ main(int argc, char *argv[])
     struct ovsdb_idl_loop ovnnb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnnb_db, &nbrec_idl_class, true, true));
     ovsdb_idl_track_add_all(ovnnb_idl_loop.idl);
+    ovsdb_idl_set_binary_transport(ovnnb_idl_loop.idl, use_binary_transport);
     ovsdb_idl_omit_alert(ovnnb_idl_loop.idl,
                          &nbrec_nb_global_col_nb_cfg_timestamp);
     ovsdb_idl_omit_alert(ovnnb_idl_loop.idl, &nbrec_nb_global_col_sb_cfg);
@@ -874,6 +884,7 @@ main(int argc, char *argv[])
         ovsdb_idl_create(ovnsb_db, &sbrec_idl_class, true, true));
     ovsdb_idl_track_add_all(ovnsb_idl_loop.idl);
     ovsdb_idl_set_write_changed_only_all(ovnsb_idl_loop.idl, true);
+    ovsdb_idl_set_binary_transport(ovnsb_idl_loop.idl, use_binary_transport);
 
     /* Omit unused columns. */
     ovsdb_idl_omit(ovnsb_idl_loop.idl, &sbrec_sb_global_col_connections);
