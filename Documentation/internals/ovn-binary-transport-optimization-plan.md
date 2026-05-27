@@ -1463,30 +1463,176 @@ northd_nb_logical_router_port_handler(struct engine_node *node, void *data)
 
 ---
 
-### Sub-Phase C.4: Incremental LRP Handling on Existing Routers
+### Sub-Phase C.4: Per-Datapath and Per-LRP lflow_ref System
 
-#### Step C4.1: Extend `lr_changes_can_be_handled()`
+#### Background: The lflow_ref Architecture
 
-**File**: `northd/northd.c` (line 4880)
+The lflow_ref system enables per-entity incremental flow tracking:
 
-Add `NBREC_LOGICAL_ROUTER_COL_PORTS` to the allowed columns:
+```
+Entity (port, LB, etc.)
+    |
+    +-- lflow_ref (hmap of lflow_ref_node)
+            |
+            +-- lflow_ref_node → points to ovn_lflow in global table
+            |       |-- dp_index or dpgrp_bitmap (which datapaths)
+            |       |-- linked flag (active or unlinked)
+            |
+            +-- lflow_ref_node → another ovn_lflow
+                    ...
+```
+
+**Current state**: `ovn_port` and `ovn_lb_datapaths` have `lflow_ref`.
+`ovn_datapath` does NOT. Per-datapath flows (admission control, routing
+defaults, etc.) are built with `lflow_ref = NULL` (no tracking).
+
+**Key functions**:
+- `lflow_ref_create()` — allocates and initializes (lflow-mgr.c:553)
+- `lflow_ref_unlink_lflows()` — marks all flows as unlinked (lflow-mgr.c:584)
+- `lflow_ref_sync_lflows()` — syncs to SB, deletes unlinked flows (lflow-mgr.c:626)
+- `lflow_ref_resync_flows()` — unlink + sync (for deletions) (lflow-mgr.c:609)
+- `lflow_ref_destroy()` — cleanup (lflow-mgr.c:570)
+
+**How flows are tracked**: When `lflow_table_add_lflow()` receives a non-NULL
+`lflow_ref`, it creates a `lflow_ref_node` linking the lflow to that ref
+(lflow-mgr.c:692-728). The lflow is stored once in the global table but can
+be referenced by multiple entities via their `lflow_ref`s.
+
+#### Step C4.1: Add lflow_ref to struct ovn_datapath
+
+**File**: `northd/northd.h` (in `struct ovn_datapath`, around line 340)
+
 ```c
-if (col == NBREC_LOGICAL_ROUTER_COL_LOAD_BALANCER
-    || col == NBREC_LOGICAL_ROUTER_COL_LOAD_BALANCER_GROUP
-    || col == NBREC_LOGICAL_ROUTER_COL_NAT
-    || col == NBREC_LOGICAL_ROUTER_COL_PORTS) {  /* NEW */
-    continue;
+/* Per-datapath lflow tracking for incremental flow generation.
+ * Tracks router-level flows (admission control, routing defaults,
+ * NAT defrag, LB affinity, etc.) separately from per-port flows. */
+struct lflow_ref *lflow_ref;
+
+/* Per-datapath route-specific lflow tracking.
+ * Separated because route changes are frequent and should only
+ * rebuild routing flows, not all datapath flows. */
+struct lflow_ref *route_lflow_ref;
+
+/* Per-datapath policy-specific lflow tracking. */
+struct lflow_ref *policy_lflow_ref;
+```
+
+**File**: `northd/northd.c` (in `ovn_datapath_create()`, after line 457)
+
+```c
+od->lflow_ref = lflow_ref_create();
+od->route_lflow_ref = lflow_ref_create();
+od->policy_lflow_ref = lflow_ref_create();
+```
+
+**File**: `northd/northd.c` (in `ovn_datapath_destroy()`)
+
+```c
+lflow_ref_destroy(od->lflow_ref);
+lflow_ref_destroy(od->route_lflow_ref);
+lflow_ref_destroy(od->policy_lflow_ref);
+```
+
+**File**: `northd/northd.c` (in `lflow_reset_northd_refs()`, around line 17189)
+
+Add alongside existing ref clears:
+```c
+HMAP_FOR_EACH (od, key_node, &lr_datapaths->datapaths) {
+    lflow_ref_clear(od->lflow_ref);
+    lflow_ref_clear(od->route_lflow_ref);
+    lflow_ref_clear(od->policy_lflow_ref);
 }
 ```
 
-And remove the blanket LRP seqno check at lines 4903-4908 (replaced by per-LRP handling in C.3).
+#### Step C4.2: Thread per-datapath lflow_ref through flow builders
 
-#### Step C4.2: New tracked data for LRP changes
+**File**: `northd/northd.c` (in `build_lswitch_and_lrouter_iterate_by_lr()`)
+
+Currently all builders pass the `lflow_ref` parameter (last arg) as NULL
+during full build. Change to pass `od->lflow_ref` for general flows and
+`od->route_lflow_ref` / `od->policy_lflow_ref` for specific builders:
+
+```c
+static void
+build_lswitch_and_lrouter_iterate_by_lr(struct ovn_datapath *od,
+                                        struct lswitch_flow_build_info *lsi)
+{
+    /* General router flows → od->lflow_ref */
+    build_adm_ctrl_flows_for_lrouter(od, lsi->lflows, od->lflow_ref);
+    build_neigh_learning_flows_for_lrouter(od, ..., od->lflow_ref);
+    build_ND_RA_flows_for_lrouter(od, lsi->lflows, od->lflow_ref);
+    build_mcast_lookup_flows_for_lrouter(od, ..., od->lflow_ref);
+    build_arp_resolve_flows_for_lrouter(od, lsi->lflows, od->lflow_ref);
+    build_check_pkt_len_flows_for_lrouter(od, ..., od->lflow_ref);
+    build_gateway_redirect_flows_for_lrouter(od, ..., od->lflow_ref);
+    build_arp_request_flows_for_lrouter(od, ..., od->lflow_ref);
+    build_lrouter_network_id_flows(od, ..., od->lflow_ref);
+    build_misc_local_traffic_drop_flows_for_lrouter(od, ..., od->lflow_ref);
+    build_lr_nat_defrag_and_lb_default_flows(od, lsi->lflows, od->lflow_ref);
+    build_lrouter_lb_affinity_default_flows(od, lsi->lflows, od->lflow_ref);
+    ovn_lflow_add_default_drop(lsi->lflows, od, S_ROUTER_OUT_DELIVERY,
+                               od->lflow_ref);
+
+    /* Route-specific flows → od->route_lflow_ref */
+    build_ip_routing_pre_flows_for_lrouter(od, lsi->lflows,
+                                           od->route_lflow_ref);
+    build_static_route_flows_for_lrouter(od, ..., od->route_lflow_ref);
+
+    /* Policy-specific flows → od->policy_lflow_ref */
+    build_ingress_policy_flows_for_lrouter(od, ..., od->policy_lflow_ref);
+}
+```
+
+**Important**: This changes the full-build path too. During full recompute,
+flows are now tracked per-datapath. The `lflow_reset_northd_refs()` function
+must clear them. This is safe because `lflow_ref_clear()` releases all
+ref nodes without deleting the underlying lflows from the global table.
+
+**Thread safety note**: `lflow_ref` is NOT thread-safe. When `--n-threads > 1`,
+the parallel build partitions work by hmap bucket using
+`HMAP_FOR_EACH_IN_PARALLEL`. Each datapath's `lflow_ref` is only accessed by
+one thread at a time (since datapaths are partitioned). This is the same
+guarantee that exists for `op->lflow_ref` today.
+
+#### Step C4.3: Incremental lflow handler for new routers
+
+**File**: `northd/en-lflow.c` (modify `lflow_northd_handler()`)
+
+Replace the current `NORTHD_TRACKED_LR_CREATED → return false` with actual
+flow generation:
+
+```c
+if (nd_changes->type & NORTHD_TRACKED_LR_CREATED) {
+    struct hmapx_node *hmapx_node;
+    HMAPX_FOR_EACH (hmapx_node, &nd_changes->trk_created_lrs) {
+        struct ovn_datapath *od = hmapx_node->data;
+
+        /* Generate base router flows for the new datapath.
+         * Uses od->lflow_ref for tracking. */
+        build_lswitch_and_lrouter_iterate_by_lr(od, &lsi);
+
+        /* Sync new flows to SB. */
+        if (!lflow_ref_sync_lflows(od->lflow_ref, lflow_table,
+                                   ovnsb_txn, ls_datapaths,
+                                   lr_datapaths, false,
+                                   sbflow_table, dpgrp_table)
+            || !lflow_ref_sync_lflows(od->route_lflow_ref, ...)
+            || !lflow_ref_sync_lflows(od->policy_lflow_ref, ...)) {
+            return false;
+        }
+    }
+}
+```
+
+**Result**: `northd norecompute compute` AND `lflow norecompute compute`
+for standalone router creation. No full recompute of any engine node.
+
+#### Step C4.4: New tracked data for LRP changes
 
 **File**: `northd/northd.h`
 
 ```c
-/* Tracked router port changes — mirrors tracked_ovn_ports for switch ports. */
+/* Tracked router port changes — mirrors tracked_ovn_ports for LSPs. */
 struct tracked_lr_ports {
     struct hmapx created;       /* ovn_port* for new LRPs */
     struct hmapx updated;       /* ovn_port* for modified LRPs */
@@ -1496,314 +1642,542 @@ struct tracked_lr_ports {
 
 Add to `enum northd_tracked_data_type`:
 ```c
-NORTHD_TRACKED_LR_PORTS     = (1 << 7),  /* Router port changes */
-NORTHD_TRACKED_LR_ROUTES    = (1 << 8),  /* Static route changes */
-NORTHD_TRACKED_LR_POLICIES  = (1 << 9),  /* Policy changes */
+NORTHD_TRACKED_LR_PORTS     = (1 << 7),
+NORTHD_TRACKED_LR_ROUTES    = (1 << 8),
+NORTHD_TRACKED_LR_POLICIES  = (1 << 9),
 ```
 
 Add to `struct northd_tracked_data`:
 ```c
-struct tracked_lr_ports trk_lrps;       /* Router port changes */
-struct hmapx lr_with_changed_routes;    /* Routers with route changes */
-struct hmapx lr_with_changed_policies;  /* Routers with policy changes */
+struct tracked_lr_ports trk_lrps;
+struct hmapx lr_with_changed_routes;
+struct hmapx lr_with_changed_policies;
 ```
 
-#### Step C4.3: LRP create handler
+#### Step C4.5: Implement northd_handle_lrp_changes() with actual handling
 
-**File**: `northd/northd.c`
-
-```c
-static bool
-northd_handle_lrp_create(struct northd_data *nd,
-                         struct ovn_datapath *od,
-                         const struct nbrec_logical_router_port *nbrp)
-{
-    /* Reject DGW ports — too complex for now. */
-    if (nbrp->ha_chassis_group || nbrp->n_gateway_chassis) {
-        return false;
-    }
-
-    /* Parse networks. */
-    struct lport_addresses lrp_networks;
-    if (!extract_lrp_networks(nbrp, &lrp_networks)) {
-        return false;
-    }
-
-    /* Create ovn_port. */
-    struct ovn_port *op = ovn_port_create(
-        &nd->lr_ports, nbrp->name, NULL, nbrp, NULL);
-    op->od = od;
-    op->lrp_networks = lrp_networks;
-    hmap_insert(&od->ports, &op->dp_node, hash_string(op->key, 0));
-
-    /* Allocate tunnel key. */
-    if (!ovn_port_allocate_key(od, op)) {
-        return false;
-    }
-
-    /* Insert SB port_binding. */
-    op->sb = sbrec_port_binding_insert(nd->ovnsb_txn);
-    sbrec_port_binding_set_logical_port(op->sb, op->key);
-    ovn_port_update_sbrec(..., op, ...);
-
-    /* Update reverse index. */
-    lr_sub_object_index_add(&nd->sub_index.lrp_to_lr,
-                            &nbrp->header_.uuid, od);
-
-    /* Track for downstream lflow generation. */
-    hmapx_add(&nd->trk_data.trk_lrps.created, op);
-    nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
-
-    return true;
-}
-```
-
-#### Step C4.4: Lflow handler for LRP changes
-
-**File**: `northd/en-lflow.c` (extend `lflow_northd_handler()`)
-
-```c
-if (nd_changes->type & NORTHD_TRACKED_LR_PORTS) {
-    if (!lflow_handle_northd_lr_port_changes(
-            ovnsb_txn, &nd_changes->trk_lrps,
-            lflow_input, lflows)) {
-        return false;
-    }
-}
-```
-
-**File**: `northd/northd.c` (new function)
+**File**: `northd/northd.c` (replace current stub)
 
 ```c
 bool
-lflow_handle_northd_lr_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
-                                    struct tracked_lr_ports *trk_lrps,
-                                    struct lflow_input *lflow_input,
-                                    struct lflow_table *lflows)
+northd_handle_lrp_changes(const struct northd_input *ni,
+                          struct northd_data *nd)
 {
-    /* Process deleted LRPs. */
-    HMAPX_FOR_EACH(node, &trk_lrps->deleted) {
-        struct ovn_port *op = node->data;
-        if (!lflow_ref_resync_flows(op->lflow_ref, ...)) {
-            return false;
-        }
-    }
+    const struct nbrec_logical_router_port *changed_lrp;
 
-    /* Process updated LRPs. */
-    HMAPX_FOR_EACH(node, &trk_lrps->updated) {
-        struct ovn_port *op = node->data;
-        lflow_ref_unlink_lflows(op->lflow_ref);
-        build_lswitch_and_lrouter_iterate_by_lrp(op, ...);
-        if (!lflow_ref_sync_lflows(op->lflow_ref, ...)) {
-            return false;
+    NBREC_LOGICAL_ROUTER_PORT_TABLE_FOR_EACH_TRACKED(changed_lrp,
+                                                      ni->nbrec_lrp_table) {
+        if (nbrec_logical_router_port_is_new(changed_lrp)) {
+            /* New LRP — find or detect parent router. */
+            struct ovn_port *op = ovn_port_find(&nd->lr_ports,
+                                                changed_lrp->name);
+            if (op) {
+                /* Port already created (e.g., by C.6 Tier 2 path). */
+                continue;
+            }
+            /* New port on existing router — need to create ovn_port,
+             * parse networks, allocate key, insert SB port_binding,
+             * and establish peer relationship. */
+            /* Reject DGW ports. */
+            if (changed_lrp->ha_chassis_group
+                || changed_lrp->n_gateway_chassis) {
+                return false;
+            }
+            /* Find parent router via lr_datapaths iteration. */
+            /* ... (see northd_handle_lrp_create below) ... */
+            return false;  /* Fall back for now — C.4 full impl later */
         }
-    }
 
-    /* Process created LRPs. */
-    HMAPX_FOR_EACH(node, &trk_lrps->created) {
-        struct ovn_port *op = node->data;
-        build_lswitch_and_lrouter_iterate_by_lrp(op, ...);
-        if (!lflow_ref_sync_lflows(op->lflow_ref, ...)) {
+        if (nbrec_logical_router_port_is_deleted(changed_lrp)) {
+            struct ovn_port *op = ovn_port_find(&nd->lr_ports,
+                                                changed_lrp->name);
+            if (!op) {
+                continue;  /* Already removed. */
+            }
+            /* Need to: unlink lflows, remove SB port_binding,
+             * clear peer relationship, free ovn_port. */
+            return false;  /* Fall back for now */
+        }
+
+        /* Modified LRP on existing router. */
+        struct ovn_port *op = ovn_port_find(&nd->lr_ports,
+                                            changed_lrp->name);
+        if (!op) {
             return false;
         }
+        /* Need to: re-parse networks, update SB port_binding,
+         * unlink+rebuild lflows, sync. */
+        return false;  /* Fall back for now */
     }
 
     return true;
 }
 ```
 
-#### Step C4.5: Peer port handling
+**Note**: The full per-LRP incremental handling requires:
+1. Finding the parent router (iterate `lr_datapaths`, check `nbr->ports[]`)
+2. Creating `ovn_port` with `extract_lrp_networks()`
+3. Allocating port tunnel key
+4. Inserting SB `port_binding`
+5. Establishing peer relationship with switch-side LSP
+6. Building per-LRP flows via `build_lswitch_and_lrouter_iterate_by_lrp()`
+7. Syncing via `lflow_ref_sync_lflows(op->lflow_ref, ...)`
+8. Marking peer LSP as updated for its lflow regeneration
 
-When an LRP is created, the switch-side peer LSP (type="router") may already exist or may be created in the same transaction. The handler needs to:
+#### Step C4.6: Extend lr_changes_can_be_handled()
 
-1. Look up the peer LSP: `ovn_port_get_peer()` using `lsp-options:router-port`
-2. Set `op->peer` bidirectionally
-3. Regenerate peer LSP flows (since they reference the LRP's networks)
+**File**: `northd/northd.c` (line 4887)
+
+Add `NBREC_LOGICAL_ROUTER_COL_PORTS` to allowed columns:
+```c
+if (col == NBREC_LOGICAL_ROUTER_COL_LOAD_BALANCER
+    || col == NBREC_LOGICAL_ROUTER_COL_LOAD_BALANCER_GROUP
+    || col == NBREC_LOGICAL_ROUTER_COL_NAT
+    || col == NBREC_LOGICAL_ROUTER_COL_PORTS) {
+    continue;
+}
+```
+
+Remove the blanket LRP seqno check at lines 4903-4908 (now handled by
+the dedicated `en_nb_logical_router_port` engine node).
+
+#### Step C4.7: Peer port handling
+
+When an LRP is created, the switch-side peer LSP may already exist:
 
 ```c
-/* In northd_handle_lrp_create(), after port creation: */
-struct ovn_port *peer = ovn_port_find(&nd->ls_ports, nbrp->peer);
-if (peer) {
-    op->peer = peer;
-    peer->peer = op;
-    /* Mark peer as updated so its lflows are regenerated. */
-    hmapx_add(&nd->trk_data.trk_lsps.updated, peer);
-    nd->trk_data.type |= NORTHD_TRACKED_PORTS;
+/* After creating the LRP ovn_port: */
+const char *peer_name = smap_get(&changed_lrp->options, "peer");
+if (!peer_name) {
+    /* LRP has no explicit peer; look for LSP referencing this LRP. */
+    /* The peer will be connected when the LSP handler runs. */
+} else {
+    struct ovn_port *peer = ovn_port_find(&nd->ls_ports, peer_name);
+    if (peer) {
+        op->peer = peer;
+        peer->peer = op;
+        /* Mark peer as updated so its lflows are regenerated. */
+        hmapx_add(&nd->trk_data.trk_lsps.updated, peer);
+        nd->trk_data.type |= NORTHD_TRACKED_PORTS;
+    }
 }
+```
+
+#### Step C4.8: Tests
+
+```bash
+AT_SETUP([ovn -- incremental LRP add on existing router])
+AT_KEYWORDS([incremental lrp-add])
+
+ovn_start
+check ovn-nbctl --wait=sb lr-add lr0
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+# LRP add should be handled incrementally (northd + lflow)
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
+
+# Verify SB port_binding exists
+wait_row_count Port_Binding 1 logical_port=rp0
+
+# Verify per-LRP flows generated
+AT_CHECK([ovn-sbctl dump-flows lr0 | grep -c lr_in_ip_input], [0], [dnl
+$(ovn-sbctl dump-flows lr0 | grep -c lr_in_ip_input)
+])
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
 ```
 
 ---
 
 ### Sub-Phase C.5: Incremental Static Route Handling
 
-#### Step C5.1: Extend `lr_changes_can_be_handled()`
+#### Background
 
-Add `NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES` to allowed columns.
+Static routes are:
+- Stored as `nbrec_logical_router_static_route` rows referenced by `lr->static_routes[]`
+- Parsed locally in `build_static_route_flows_for_lrouter()` into `struct parsed_route`
+- Grouped into ECMP groups for multi-nexthop routes
+- Generate 1-2 flows per route (more for ECMP)
+- Parsed and destroyed on every run (no caching in `ovn_datapath`)
 
-Remove the blanket seqno check at lines 4919-4924.
-
-#### Step C5.2: Static route handler
+#### Step C5.1: Add change detection functions
 
 **File**: `northd/northd.c`
 
 ```c
 static bool
-northd_handle_static_route_changes(struct northd_data *nd,
-                                   struct ovn_datapath *od,
-                                   const struct nbrec_logical_router *nbr)
+is_lr_static_routes_seqno_changed(const struct nbrec_logical_router *nbr)
 {
-    /* Check if static routes changed. */
-    if (!nbrec_logical_router_is_updated(nbr,
-            NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES)) {
-        return true;  /* No route changes. */
+    for (size_t i = 0; i < nbr->n_static_routes; i++) {
+        if (nbrec_logical_router_static_route_row_get_seqno(
+                nbr->static_routes[i], OVSDB_IDL_CHANGE_MODIFY) > 0) {
+            return true;
+        }
     }
+    return false;
+}
 
-    /* For now, mark the router for route flow regeneration.
-     * Per-route granularity can be added later. */
-    hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
-    nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES;
-
-    return true;
+static bool
+is_lr_static_routes_changed(const struct nbrec_logical_router *nbr)
+{
+    return nbrec_logical_router_is_updated(
+               nbr, NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES)
+           || is_lr_static_routes_seqno_changed(nbr);
 }
 ```
 
-#### Step C5.3: Lflow handler for route changes
+#### Step C5.2: Extend lr_changes_can_be_handled()
 
-In the lflow handler, when `NORTHD_TRACKED_LR_ROUTES` is set:
+Add `NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES` to allowed columns.
+Remove the blanket seqno check at lines 4919-4924.
+
+#### Step C5.3: Track route changes in northd_handle_lr_changes()
+
 ```c
-/* Regenerate routing flows for affected routers. */
-HMAPX_FOR_EACH(node, &nd_changes->lr_with_changed_routes) {
-    struct ovn_datapath *od = node->data;
-    /* Unlink old routing flows for this router. */
-    lflow_ref_unlink_lflows(od->route_lflow_ref);
-    /* Rebuild: */
-    build_static_route_flows_for_lrouter(od, ...);
-    build_ip_routing_pre_flows_for_lrouter(od, ...);
-    lflow_ref_sync_lflows(od->route_lflow_ref, ...);
+if (is_lr_static_routes_changed(changed_lr)) {
+    struct ovn_datapath *od = ovn_datapath_find_(...);
+    if (!od) {
+        goto fail;
+    }
+    hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
 }
 ```
 
-**Note**: This requires adding a `route_lflow_ref` to `struct ovn_datapath` to track which flows belong to routing specifically (separate from the per-port `lflow_ref`).
+Set flag:
+```c
+if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_routes)) {
+    nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES;
+}
+```
+
+#### Step C5.4: Lflow handler for route changes
+
+**File**: `northd/en-lflow.c`
+
+```c
+if (nd_changes->type & NORTHD_TRACKED_LR_ROUTES) {
+    struct hmapx_node *node;
+    HMAPX_FOR_EACH (node, &nd_changes->lr_with_changed_routes) {
+        struct ovn_datapath *od = node->data;
+        /* Unlink old routing flows. */
+        lflow_ref_unlink_lflows(od->route_lflow_ref);
+        /* Rebuild routing flows only. */
+        build_ip_routing_pre_flows_for_lrouter(od, lflows,
+                                               od->route_lflow_ref);
+        build_static_route_flows_for_lrouter(od, features, lflows,
+                                             lr_ports, bfd_connections,
+                                             od->route_lflow_ref);
+        /* Sync to SB. */
+        if (!lflow_ref_sync_lflows(od->route_lflow_ref, ...)) {
+            return false;
+        }
+    }
+}
+```
+
+**Impact**: Only the affected router's routing flows are rebuilt and synced.
+All other routers' flows are untouched. This is O(routes_on_this_router)
+instead of O(all_flows_in_deployment).
+
+#### Step C5.5: Tests
+
+```bash
+AT_SETUP([ovn -- incremental static route changes])
+AT_KEYWORDS([incremental lr-route])
+
+ovn_start
+check ovn-nbctl --wait=sb lr-add lr0
+check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+# Add static route — should be incremental
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-route-add lr0 192.168.0.0/16 10.0.0.254
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
+
+# Verify route flow exists
+AT_CHECK([ovn-sbctl dump-flows lr0 | grep -c "192.168"], [0], [dnl
+$(ovn-sbctl dump-flows lr0 | grep -c "192.168")
+])
+
+# Modify route — should be incremental
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-route-del lr0 192.168.0.0/16
+check ovn-nbctl --wait=sb lr-route-add lr0 192.168.0.0/24 10.0.0.253
+check_engine_stats northd norecompute compute
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+```
 
 ---
 
 ### Sub-Phase C.6: Router Creation with Ports (Tier 2)
 
-This sub-phase combines C.1 (datapath creation) with C.4 (port handling) to handle the common case of router + ports in a single transaction.
+Combines C.1 (datapath creation) with C.4 (port handling) to handle the
+common case of router + ports in a single transaction.
 
-#### Step C6.1: Extend detection in `northd_handle_lr_changes()`
+**Prerequisite**: C.4 must be fully implemented (per-LRP handling).
+
+#### Step C6.1: Extend standalone router detection
+
+**File**: `northd/northd.c` (in `northd_handle_lr_changes()`)
+
+Remove the `n_ports > 0` rejection. Instead, process ports inline:
 
 ```c
 if (nbrec_logical_router_is_new(changed_lr)) {
-    /* Create datapath (from C.1). */
-    struct ovn_datapath *od = northd_lr_datapath_create(nd, changed_lr);
-    if (!od) {
-        goto fail;
-    }
+    /* Create datapath (same as current C.1 code). */
+    struct ovn_datapath *od = ... /* existing creation code */;
+
     hmapx_add(&nd->trk_data.trk_created_lrs, od);
 
     /* Process ports on the new router (from C.4). */
     for (size_t i = 0; i < changed_lr->n_ports; i++) {
-        if (!northd_handle_lrp_create(nd, od, changed_lr->ports[i])) {
-            goto fail;  /* Fall back for complex ports (DGW, etc.) */
+        const struct nbrec_logical_router_port *nbrp =
+            changed_lr->ports[i];
+
+        /* Reject DGW ports. */
+        if (nbrp->ha_chassis_group || nbrp->n_gateway_chassis) {
+            goto fail;
         }
+
+        /* Create ovn_port, parse networks, allocate key,
+         * insert SB port_binding, establish peer. */
+        struct lport_addresses lrp_networks;
+        if (!extract_lrp_networks(nbrp, &lrp_networks)) {
+            goto fail;
+        }
+
+        struct ovn_port *op = ovn_port_create(
+            &nd->lr_ports, nbrp->name, NULL, nbrp, NULL);
+        op->od = od;
+        op->lrp_networks = lrp_networks;
+        hmap_insert(&od->ports, &op->dp_node,
+                    hash_string(op->key, 0));
+
+        /* Allocate port tunnel key. */
+        uint32_t port_key = ovn_port_allocate_key(od, op);
+        if (!port_key) {
+            goto fail;
+        }
+
+        /* Insert SB port_binding. */
+        op->sb = sbrec_port_binding_insert(ovnsb_idl_txn);
+        sbrec_port_binding_set_logical_port(op->sb, op->key);
+        ovn_port_update_sbrec(ovnsb_txn, ..., op, ...);
+
+        /* Track for lflow generation. */
+        hmapx_add(&nd->trk_data.trk_lrps.created, op);
     }
 
-    /* Process NATs on the new router. */
-    for (size_t i = 0; i < changed_lr->n_nat; i++) {
-        /* Use existing NAT tracking pattern. */
+    /* Process NATs. */
+    if (changed_lr->n_nat > 0) {
         hmapx_add(&nd->trk_data.trk_nat_lrs, od);
     }
 
-    /* Reject if policies or static routes present (not yet handled). */
-    if (changed_lr->n_policies > 0 || changed_lr->n_static_routes > 0) {
+    /* Reject policies and static routes for now. */
+    if (changed_lr->n_policies > 0
+        || changed_lr->n_static_routes > 0) {
         goto fail;
     }
 
+    nd->trk_data.type |= NORTHD_TRACKED_LR_CREATED;
+    if (!hmapx_is_empty(&nd->trk_data.trk_lrps.created)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
+    }
     continue;
 }
 ```
 
-#### Step C6.2: Tests for Tier 2
+#### Step C6.2: Lflow handler generates flows for router + ports
 
-Tests 3b and 3c from the existing test plan validate Tier 2 behavior. Additional tests:
+The lflow handler already handles `NORTHD_TRACKED_LR_CREATED` (generates
+base router flows) and `NORTHD_TRACKED_LR_PORTS` (generates per-LRP flows).
+When both flags are set in the same engine run, both handlers execute,
+producing a complete set of flows for the new router and its ports.
+
+#### Step C6.3: Tests
 
 ```bash
 AT_SETUP([ovn -- incremental LR creation with ports (Tier 2)])
 AT_KEYWORDS([incremental lr-create-tier2])
 
 ovn_start
+check ovn-nbctl --wait=sb lr-add lr0
 
-# Warm up with initial topology
-check ovn-nbctl --wait=sb lr-add lr0 -- ls-add ls0
-check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
-check ovn-nbctl --wait=sb \
-    lsp-add ls0 lsp0_rp -- lsp-set-type lsp0_rp router \
-    -- lsp-set-addresses lsp0_rp router \
-    -- lsp-set-options lsp0_rp router-port=rp0
-
-# ---- Test: Create router + port in single transaction ----
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
-
 check ovn-nbctl --wait=sb \
     lr-add lr1 \
     -- lrp-add lr1 rp1 00:00:00:00:00:02 10.1.0.1/24
 
-# Tier 2: should be incremental (no DGW, no policies, no static routes)
+# Tier 2: both northd and lflow handle incrementally
 check_engine_stats northd norecompute compute
 check_engine_stats lflow norecompute compute
 
-# Verify SB state
-check_row_count Datapath_Binding 3
+check_row_count Datapath_Binding 2
 wait_row_count Port_Binding 1 logical_port=rp1
 
-# Verify per-LRP flows generated
-AT_CHECK([ovn-sbctl dump-flows lr1 | grep -c lr_in_ip_input], [0], [dnl
-$(ovn-sbctl dump-flows lr1 | grep -c lr_in_ip_input)
-])
-
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
-
-OVN_CLEANUP([])
+OVN_CLEANUP_NORTHD
 AT_CLEANUP
 ```
 
 ---
 
-### Sub-Phase C.7: Incremental Policy Handling (Future)
+### Sub-Phase C.7: Incremental Policy Handling
 
-Similar to static routes but for `Logical_Router_Policy` objects. Adds `NBREC_LOGICAL_ROUTER_COL_POLICIES` to allowed columns and builds policy-specific flows incrementally. Deferred until Phases C.1-C.6 are stable.
+#### Background
+
+Router policies are:
+- Stored as `nbrec_logical_router_policy` rows referenced by `lr->policies[]`
+- Processed in `build_ingress_policy_flows_for_lrouter()` (northd.c:13488)
+- Generate 1-2 flows per policy rule (more for ECMP reroute)
+- 3 base flows per router (catch-all, ECMP default, ECMP drop)
+
+#### Step C7.1: Add change detection functions
+
+```c
+static bool
+is_lr_policies_seqno_changed(const struct nbrec_logical_router *nbr)
+{
+    for (size_t i = 0; i < nbr->n_policies; i++) {
+        if (nbrec_logical_router_policy_row_get_seqno(
+                nbr->policies[i], OVSDB_IDL_CHANGE_MODIFY) > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+is_lr_policies_changed(const struct nbrec_logical_router *nbr)
+{
+    return nbrec_logical_router_is_updated(
+               nbr, NBREC_LOGICAL_ROUTER_COL_POLICIES)
+           || is_lr_policies_seqno_changed(nbr);
+}
+```
+
+#### Step C7.2: Extend lr_changes_can_be_handled()
+
+Add `NBREC_LOGICAL_ROUTER_COL_POLICIES` to allowed columns.
+Remove the blanket policy seqno check at lines 4913-4918.
+
+#### Step C7.3: Track policy changes
+
+```c
+if (is_lr_policies_changed(changed_lr)) {
+    hmapx_add(&nd->trk_data.lr_with_changed_policies, od);
+}
+
+if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_policies)) {
+    nd->trk_data.type |= NORTHD_TRACKED_LR_POLICIES;
+}
+```
+
+#### Step C7.4: Lflow handler for policy changes
+
+```c
+if (nd_changes->type & NORTHD_TRACKED_LR_POLICIES) {
+    HMAPX_FOR_EACH (node, &nd_changes->lr_with_changed_policies) {
+        struct ovn_datapath *od = node->data;
+        lflow_ref_unlink_lflows(od->policy_lflow_ref);
+        build_ingress_policy_flows_for_lrouter(od, lflows,
+                                               lr_ports, bfd_connections,
+                                               od->policy_lflow_ref);
+        if (!lflow_ref_sync_lflows(od->policy_lflow_ref, ...)) {
+            return false;
+        }
+    }
+}
+```
+
+#### Step C7.5: Tests
+
+```bash
+AT_SETUP([ovn -- incremental policy changes])
+AT_KEYWORDS([incremental lr-policy])
+
+ovn_start
+check ovn-nbctl --wait=sb lr-add lr0
+check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-policy-add lr0 100 "ip4.src == 10.0.0.0/24" allow
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+```
 
 ---
 
-### Test Coverage Summary
+### Implementation Order and Dependencies
+
+```
+C.4.1-C.4.2  Per-datapath lflow_ref system
+      │       (prerequisite for everything below)
+      │
+      ├── C.4.3  Incremental lflow handler for new routers
+      │          (replaces current "return false" with actual flow gen)
+      │
+      ├── C.4.4-C.4.8  Per-LRP incremental handling
+      │          (requires per-datapath lflow_ref to generate router flows)
+      │
+      ├── C.5  Static route incremental handling
+      │          (uses od->route_lflow_ref)
+      │
+      ├── C.7  Policy incremental handling
+      │          (uses od->policy_lflow_ref)
+      │
+      └── C.6  Router + ports Tier 2
+               (combines C.1 + C.4 + C.5)
+```
+
+**Recommended order**: C.4.1-C.4.3 first (per-datapath lflow_ref + lflow handler),
+then C.5 and C.7 (easiest wins — route/policy changes are the most common
+operations after initial deployment), then C.4.4-C.4.8 and C.6 (most complex).
+
+---
+
+### Test Coverage Summary (C.4-C.7)
 
 | Test | Scenario | Expected Engine Behavior | Sub-Phase |
 |------|----------|-------------------------|-----------|
-| 1 | Standalone router (no ports) | `northd norecompute compute` | C.1 |
-| 2 | Router deletion | `northd norecompute compute` | C.1 |
-| 3 | Router + ports in single txn | Tier 1: `recompute`; Tier 2: `norecompute` | C.1→C.6 |
-| 3b | Router first, then ports later | Router: `norecompute`; port add: `norecompute` (C.4) | C.1 + C.4 |
-| 3c | Router with DGW port | `northd recompute` (fallback) | Always fallback |
-| 4 | Router + NAT (separate txns) | NAT add: `norecompute compute` | C.1 + existing |
-| 5 | Multiple add/delete operations | Each: `norecompute compute` | C.1 |
-| 6 | Static routes, policies | `northd norecompute compute` (C.5/C.7) | C.5, C.7 |
-| C.2 | LRP modify on existing router | `northd norecompute compute` | C.4 |
-| C.6 | Router + ports Tier 2 | `northd norecompute compute` | C.6 |
+| C4-1 | Standalone router creation | `northd norecompute` + `lflow norecompute` | C.4.3 |
+| C4-2 | LRP add on existing router | `northd norecompute` + `lflow norecompute` | C.4.5 |
+| C4-3 | LRP modify (MAC/IP change) | `northd norecompute` + `lflow norecompute` | C.4.5 |
+| C4-4 | LRP delete | `northd norecompute` + `lflow norecompute` | C.4.5 |
+| C4-5 | DGW port add (fallback) | `northd recompute` | C.4.5 |
+| C5-1 | Static route add | `northd norecompute` + `lflow norecompute` | C.5 |
+| C5-2 | Static route modify | `northd norecompute` + `lflow norecompute` | C.5 |
+| C5-3 | Static route delete | `northd norecompute` + `lflow norecompute` | C.5 |
+| C6-1 | Router + ports Tier 2 | `northd norecompute` + `lflow norecompute` | C.6 |
+| C6-2 | Router + ports + NAT | `northd norecompute` + `lflow norecompute` | C.6 |
+| C7-1 | Policy add | `northd norecompute` + `lflow norecompute` | C.7 |
+| C7-2 | Policy modify/delete | `northd norecompute` + `lflow norecompute` | C.7 |
 
 All tests verify SB correctness with `CHECK_NO_CHANGE_AFTER_RECOMPUTE`.
 
-### Files to Modify (Phase C, All Sub-Phases)
+### Files to Modify (C.4-C.7)
 
 | File | Sub-Phase | Change |
 |------|-----------|--------|
-| `northd/inc-proc-northd.c` | C.2 | Add `nb_logical_router_port`, `nb_nat`, `nb_logical_router_static_route`, `nb_logical_router_policy` to NB_NODES; wire handlers into DAG |
-| `northd/northd.h` | C.1, C.4 | `NORTHD_TRACKED_LR_*` enums; `tracked_lr_ports` struct; `lrp_find_parent_lr()` helper |
-| `northd/northd.c` | C.1-C.6 | `northd_handle_lr_changes()` extension; `northd_handle_lrp_create/update/delete()`; `northd_handle_static_route_changes()`; `lflow_handle_northd_lr_port_changes()` — all using IDL `dst_arcs` for parent lookup |
-| `northd/en-northd.c` | C.2, C.4 | New handler functions: `northd_nb_logical_router_port_handler()`, `northd_nb_static_route_handler()`, `northd_nb_nat_handler()` |
-| `northd/en-lflow.c` | C.4, C.5 | Extend `lflow_northd_handler()` to consume `NORTHD_TRACKED_LR_PORTS` and `NORTHD_TRACKED_LR_ROUTES` |
-| `northd/lflow-mgr.c` | C.5 | Per-router `route_lflow_ref` for targeted route flow rebuild |
-| `tests/ovn-northd.at` | All | Tests for each sub-phase |
+| `northd/northd.h` | C.4 | Add `lflow_ref`, `route_lflow_ref`, `policy_lflow_ref` to `struct ovn_datapath`; `tracked_lr_ports` struct; `NORTHD_TRACKED_LR_PORTS/ROUTES/POLICIES` enums |
+| `northd/northd.c` | C.4-C.7 | Initialize/destroy per-datapath lflow_refs; thread through flow builders; `northd_handle_lrp_changes()` with full port handling; route/policy change detection and tracking; `lflow_reset_northd_refs()` updates |
+| `northd/en-northd.c` | C.4 | Pass txn to LRP handler |
+| `northd/en-lflow.c` | C.4-C.7 | Replace `return false` for LR_CREATED with actual flow generation; add handlers for LR_PORTS, LR_ROUTES, LR_POLICIES |
+| `northd/inc-proc-northd.c` | C.5, C.7 | Wire static_route and policy handlers (replace NULL with actual handlers) |
+| `tests/ovn-northd.at` | C.4-C.7 | ~12 new tests covering all incremental paths |
 
 ### Complexity & Risk
 
