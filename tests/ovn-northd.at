@@ -13676,8 +13676,10 @@ check_row_count Datapath_Binding 2
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-del lr1
 
-# Deletion still triggers recompute (not yet incremental)
-check_engine_stats northd recompute nocompute
+# Standalone router deletion handled incrementally by northd.
+# Lflow still recomputes for datapath group cleanup.
+check_engine_stats northd norecompute compute
+check_engine_stats lflow recompute nocompute
 check_row_count Datapath_Binding 1
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
@@ -13701,8 +13703,8 @@ check ovn-nbctl --wait=sb \
     lr-add lr1 \
     -- lrp-add lr1 rp1 00:00:00:00:00:02 10.1.0.1/24
 
-# Router with ports in same txn falls back to recompute
-check_engine_stats northd recompute nocompute
+# Router with ports in same txn — handled incrementally by northd (C.6)
+check_engine_stats northd norecompute compute
 
 check_row_count Datapath_Binding 2
 
@@ -13760,10 +13762,10 @@ check ovn-nbctl --wait=sb lr-add lr2
 check_engine_stats northd norecompute compute
 check_row_count Datapath_Binding 3
 
-# ---- Delete lr1 (recompute — deletion not yet incremental) ----
+# ---- Delete lr1 (northd incremental, lflow recomputes) ----
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-del lr1
-check_engine_stats northd recompute nocompute
+check_engine_stats northd norecompute compute
 check_row_count Datapath_Binding 2
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
@@ -13788,8 +13790,8 @@ check ovn-nbctl --wait=sb lr-add lr1 \
     -- lrp-add lr1 rp1 00:00:00:00:00:02 10.1.0.1/24 \
     -- lr-nat-add lr1 dnat_and_snat 172.16.1.1 10.1.0.11
 
-# Router with NAT + port in same txn falls back to recompute
-check_engine_stats northd recompute nocompute
+# Router with NAT + port — handled incrementally by northd (C.6)
+check_engine_stats northd norecompute compute
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 

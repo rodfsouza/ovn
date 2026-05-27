@@ -5009,16 +5009,20 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
     NBREC_LOGICAL_ROUTER_TABLE_FOR_EACH_TRACKED (changed_lr,
                                              ni->nbrec_logical_router_table) {
         if (nbrec_logical_router_is_new(changed_lr)) {
-            /* Incremental handling of standalone router creation.
-             * Fall back for routers with ports, NATs, LBs, policies,
-             * or static routes in the same transaction. */
-            if (changed_lr->n_ports > 0
-                || changed_lr->n_nat > 0
-                || changed_lr->n_load_balancer > 0
-                || changed_lr->n_policies > 0
-                || changed_lr->n_static_routes > 0
+            /* Incremental handling of router creation.
+             * Supports routers with simple ports (no DGW).
+             * Falls back for LBs and disabled routers. */
+            if (changed_lr->n_load_balancer > 0
                 || !lrouter_is_enabled(changed_lr)) {
                 goto fail;
+            }
+
+            /* Check for DGW ports — too complex for incremental. */
+            for (size_t i = 0; i < changed_lr->n_ports; i++) {
+                if (changed_lr->ports[i]->ha_chassis_group
+                    || changed_lr->ports[i]->n_gateway_chassis) {
+                    goto fail;
+                }
             }
 
             /* Verify not already in lr_datapaths. */
@@ -5091,16 +5095,104 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             /* Rebuild array index (new datapath added). */
             ods_build_array_index(&nd->lr_datapaths);
 
+            /* Process ports on the new router (C.6). */
+            struct sset active_ha_chassis_grps =
+                SSET_INITIALIZER(&active_ha_chassis_grps);
+            for (size_t i = 0; i < changed_lr->n_ports; i++) {
+                const struct nbrec_logical_router_port *nbrp =
+                    changed_lr->ports[i];
+
+                struct lport_addresses lrp_networks;
+                if (!extract_lrp_networks(nbrp, &lrp_networks)) {
+                    sset_destroy(&active_ha_chassis_grps);
+                    goto fail;
+                }
+
+                struct ovn_port *op = ovn_port_create(
+                    &nd->lr_ports, nbrp->name, NULL, nbrp, NULL);
+                op->od = od;
+                op->lrp_networks = lrp_networks;
+                hmap_insert(&od->ports, &op->dp_node,
+                            hash_string(op->key, 0));
+
+                /* Allocate port tunnel key. */
+                if (!ovn_port_allocate_key(ni->sbrec_chassis_table,
+                                           op)) {
+                    sset_destroy(&active_ha_chassis_grps);
+                    goto fail;
+                }
+
+                /* Insert SB port_binding. */
+                op->sb = sbrec_port_binding_insert(ovnsb_idl_txn);
+                sbrec_port_binding_set_logical_port(op->sb, op->key);
+                ovn_port_update_sbrec(
+                    ovnsb_idl_txn,
+                    ni->sbrec_chassis_by_name,
+                    ni->sbrec_chassis_by_hostname,
+                    ni->sbrec_ha_chassis_grp_by_name,
+                    ni->sbrec_mirror_table,
+                    op, NULL, &active_ha_chassis_grps);
+            }
+            sset_destroy(&active_ha_chassis_grps);
+
+            /* Track NATs if present. */
+            if (changed_lr->n_nat > 0) {
+                hmapx_add(&nd->trk_data.trk_nat_lrs, od);
+            }
+
+            /* Track routes if present. */
+            if (changed_lr->n_static_routes > 0) {
+                hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
+            }
+
+            /* Track policies if present. */
+            if (changed_lr->n_policies > 0) {
+                hmapx_add(&nd->trk_data.lr_with_changed_policies, od);
+            }
+
             /* Track for downstream handlers. */
             hmapx_add(&nd->trk_data.trk_created_lrs, od);
             continue;
         }
 
         if (nbrec_logical_router_is_deleted(changed_lr)) {
-            /* Router deletion — fall back to recompute for now.
-             * Incremental deletion requires cleaning up flows, port
-             * bindings, multicast groups, and lr_group references. */
-            goto fail;
+            struct ovn_datapath *od = ovn_datapath_find_(
+                &nd->lr_datapaths.datapaths,
+                &changed_lr->header_.uuid);
+            if (!od) {
+                /* Already removed or never tracked. */
+                continue;
+            }
+
+            /* If router has ports, LBs, or is part of a multi-router
+             * group, fall back to recompute. */
+            if (!hmap_is_empty(&od->ports) || od->lr_group) {
+                goto fail;
+            }
+
+            /* Unlink all flows from lflow_refs. Actual deletion
+             * from SB happens when lflow recompute runs. */
+            lflow_ref_clear(od->lflow_ref);
+            lflow_ref_clear(od->route_lflow_ref);
+            lflow_ref_clear(od->policy_lflow_ref);
+
+            /* Delete SB datapath_binding. */
+            if (od->sb) {
+                sbrec_datapath_binding_delete(od->sb);
+            }
+
+            /* Remove from lr_list. */
+            ovs_list_remove(&od->lr_list);
+
+            /* Destroy the datapath (removes from lr_datapaths hmap). */
+            ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
+
+            /* Rebuild array index. */
+            ods_build_array_index(&nd->lr_datapaths);
+
+            /* Track deletion for downstream handlers. */
+            nd->trk_data.type |= NORTHD_TRACKED_LR_DELETED;
+            continue;
         }
 
         /* Presently only able to handle load balancer,

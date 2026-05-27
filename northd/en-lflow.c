@@ -128,7 +128,11 @@ lflow_northd_handler(struct engine_node *node,
         return false;
     }
 
-    /* Router deletion not yet incrementally handled for lflows. */
+    /* Router deletion: lflow_refs were already cleared in the northd
+     * handler. Any flows that were only referenced by the deleted
+     * datapath will be garbage collected during the next full lflow
+     * sync. For now, trigger lflow recompute to ensure proper cleanup
+     * of datapath group memberships in shared flows. */
     if (northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
         return false;
     }
