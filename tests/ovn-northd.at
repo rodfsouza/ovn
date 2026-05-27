@@ -13729,12 +13729,13 @@ check ovn-nbctl --wait=sb lr-add lr1
 check_engine_stats northd norecompute compute
 check_row_count Datapath_Binding 2
 
-# ---- Step 2: Add port to existing router (incremental via LRP handler) ----
+# ---- Step 2: Add port to existing router (LRP handler creates port
+# and SB binding, then returns false to trigger lflow recompute) ----
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb \
     lrp-add lr1 rp1 00:00:00:00:00:02 10.1.0.1/24
 
-check_engine_stats northd norecompute compute
+check_engine_stats northd recompute nocompute
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
@@ -13838,7 +13839,9 @@ check ovn-nbctl --wait=sb lr-add lr0
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
 
-check_engine_stats northd norecompute compute
+# LRP handler creates port + SB binding, then returns false for
+# lflow recompute (per-LRP lflow tracking is future work).
+check_engine_stats northd recompute nocompute
 wait_row_count Port_Binding 1 logical_port=rp0
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
@@ -13859,7 +13862,9 @@ check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lrp-del rp0
 
-check_engine_stats northd norecompute compute
+# LRP handler deletes port + SB binding, then returns false for
+# lflow recompute (per-LRP lflow tracking is future work).
+check_engine_stats northd recompute nocompute
 check_row_count Port_Binding 0
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
@@ -13904,7 +13909,9 @@ check ovn-nbctl --wait=sb lb-add lb1 10.0.0.100:80 10.0.0.1:80
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-add lr1 -- lr-lb-add lr1 lb1
 
-check_engine_stats northd norecompute compute
+# Router with LB falls back to recompute (bitmap sizing issue
+# with ovn_lb_datapaths prevents safe incremental LB association).
+check_engine_stats northd recompute nocompute
 check_row_count Datapath_Binding 1
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE

@@ -5010,9 +5010,12 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
                                              ni->nbrec_logical_router_table) {
         if (nbrec_logical_router_is_new(changed_lr)) {
             /* Incremental handling of router creation.
-             * Supports routers with ports, NATs, routes, policies, LBs.
-             * Falls back only for disabled routers. */
-            if (!lrouter_is_enabled(changed_lr)) {
+             * Supports routers with ports, NATs, routes, policies.
+             * Falls back for LBs (bitmap sizing issue with
+             * ovn_lb_datapaths) and disabled routers. */
+            if (changed_lr->n_load_balancer > 0
+                || changed_lr->n_load_balancer_group > 0
+                || !lrouter_is_enabled(changed_lr)) {
                 goto fail;
             }
 
@@ -5147,45 +5150,6 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             /* Track policies if present. */
             if (changed_lr->n_policies > 0) {
                 hmapx_add(&nd->trk_data.lr_with_changed_policies, od);
-            }
-
-            /* Associate load balancers with the new router (C.11).
-             * Uses ovn_lb_datapaths_add_lr() to add the router to
-             * each LB's bitmap without rebuilding the entire map. */
-            for (size_t i = 0; i < changed_lr->n_load_balancer; i++) {
-                const struct uuid *lb_uuid =
-                    &changed_lr->load_balancer[i]->header_.uuid;
-                struct ovn_lb_datapaths *lb_dps =
-                    ovn_lb_datapaths_find(&nd->lb_datapaths_map, lb_uuid);
-                if (lb_dps) {
-                    ovn_lb_datapaths_add_lr(lb_dps, 1, &od);
-                    hmapx_add(&nd->trk_data.trk_lbs.crupdated, lb_dps);
-                }
-            }
-            for (size_t i = 0; i < changed_lr->n_load_balancer_group; i++) {
-                const struct uuid *lbg_uuid =
-                    &changed_lr->load_balancer_group[i]->header_.uuid;
-                struct ovn_lb_group_datapaths *lbg_dps =
-                    ovn_lb_group_datapaths_find(
-                        &nd->lb_group_datapaths_map, lbg_uuid);
-                if (lbg_dps) {
-                    ovn_lb_group_datapaths_add_lr(lbg_dps, od);
-                    for (size_t j = 0; j < lbg_dps->lb_group->n_lbs; j++) {
-                        const struct uuid *lb_uuid2 =
-                            &lbg_dps->lb_group->lbs[j]->nlb->header_.uuid;
-                        struct ovn_lb_datapaths *lb_dps2 =
-                            ovn_lb_datapaths_find(&nd->lb_datapaths_map,
-                                                  lb_uuid2);
-                        if (lb_dps2) {
-                            ovn_lb_datapaths_add_lr(lb_dps2, 1, &od);
-                            hmapx_add(&nd->trk_data.trk_lbs.crupdated,
-                                      lb_dps2);
-                        }
-                    }
-                }
-            }
-            if (!hmapx_is_empty(&nd->trk_data.trk_lbs.crupdated)) {
-                nd->trk_data.type |= NORTHD_TRACKED_LBS;
             }
 
             /* Track for downstream handlers. */
@@ -5417,9 +5381,11 @@ northd_handle_lrp_changes(
                 op, NULL, &active_ha);
             sset_destroy(&active_ha);
 
-            /* Mark northd as updated so lflow recomputes with the
-             * new port.  Full per-LRP lflow tracking is future work. */
-            nd->trk_data.type |= NORTHD_TRACKED_LR_CREATED;
+            /* Port created but per-LRP lflow tracking not yet implemented.
+             * Trigger lflow recompute by returning false. The port and SB
+             * port_binding are already created; lflow recompute will
+             * generate flows for the new port. */
+            return false;
 
         } else if (nbrec_logical_router_port_is_deleted(changed_lrp)) {
             struct ovn_port *op = ovn_port_find(
@@ -5447,13 +5413,14 @@ northd_handle_lrp_changes(
                 op->peer->peer = NULL;
             }
 
-            /* Remove from hashmaps and destroy. */
+            /* Remove from hashmaps and destroy. Port and SB binding
+             * are cleaned up; return false to trigger lflow recompute
+             * for flow cleanup. */
             hmap_remove(&nd->lr_ports, &op->key_node);
             hmap_remove(&op->od->ports, &op->dp_node);
             ovn_port_destroy_orphan(op);
 
-            /* Trigger lflow recompute for cleanup. */
-            nd->trk_data.type |= NORTHD_TRACKED_LR_DELETED;
+            return false;
 
         } else {
             /* Modified LRP — fall back to recompute. */
