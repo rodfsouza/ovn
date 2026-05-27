@@ -122,6 +122,8 @@ enum northd_tracked_data_type {
     NORTHD_TRACKED_LS_ACLS     = (1 << 4),
     NORTHD_TRACKED_LR_CREATED  = (1 << 5),
     NORTHD_TRACKED_LR_DELETED  = (1 << 6),
+    NORTHD_TRACKED_LR_ROUTES  = (1 << 7),
+    NORTHD_TRACKED_LR_POLICIES = (1 << 8),
 };
 
 /* Track what's changed in the northd engine node.
@@ -153,6 +155,14 @@ struct northd_tracked_data {
     /* Tracked deleted logical routers.
      * hmapx node is 'struct ovn_datapath *'. */
     struct hmapx trk_deleted_lrs;
+
+    /* Tracked routers whose static routes have changed.
+     * hmapx node data is 'struct ovn_datapath *'. */
+    struct hmapx lr_with_changed_routes;
+
+    /* Tracked routers whose policies have changed.
+     * hmapx node data is 'struct ovn_datapath *'. */
+    struct hmapx lr_with_changed_policies;
 };
 
 struct northd_data {
@@ -355,6 +365,18 @@ struct ovn_datapath {
     /* Map of ovn_port objects belonging to this datapath.
      * This map doesn't include derived ports. */
     struct hmap ports;
+
+    /* Per-datapath lflow tracking for incremental flow generation.
+     * General router flows (admission control, NAT defrag, LB affinity,
+     * mcast lookup, gateway redirect, ARP request, network ID, etc.). */
+    struct lflow_ref *lflow_ref;
+
+    /* Route-specific lflow tracking — separated so route changes only
+     * rebuild routing flows, not all datapath flows. */
+    struct lflow_ref *route_lflow_ref;
+
+    /* Policy-specific lflow tracking — separated for the same reason. */
+    struct lflow_ref *policy_lflow_ref;
 };
 
 const struct ovn_datapath *ovn_datapath_find(const struct hmap *datapaths,
@@ -698,6 +720,15 @@ struct ls_stateful_tracked_data;
 void build_lflows(struct ovsdb_idl_txn *ovnsb_txn,
                   struct lflow_input *input_data,
                   struct lflow_table *);
+void build_lr_flows_for_datapath(struct ovn_datapath *od,
+                                 struct lflow_input *input_data,
+                                 struct lflow_table *lflows);
+void build_lr_route_flows_for_datapath(struct ovn_datapath *od,
+                                       struct lflow_input *input_data,
+                                       struct lflow_table *lflows);
+void build_lr_policy_flows_for_datapath(struct ovn_datapath *od,
+                                        struct lflow_input *input_data,
+                                        struct lflow_table *lflows);
 void lflow_reset_northd_refs(struct lflow_input *);
 
 bool lflow_handle_northd_port_changes(struct ovsdb_idl_txn *ovnsb_txn,

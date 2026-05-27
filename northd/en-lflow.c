@@ -128,12 +128,8 @@ lflow_northd_handler(struct engine_node *node,
         return false;
     }
 
-    /* New/deleted router datapaths require full lflow recompute because
-     * per-datapath lflow_ref is not yet implemented.  The northd handler
-     * materializes the datapath and SB bindings; lflow regenerates all
-     * flows including for the new router. */
-    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED
-        || northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
+    /* Router deletion not yet incrementally handled for lflows. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
         return false;
     }
 
@@ -142,6 +138,92 @@ lflow_northd_handler(struct engine_node *node,
 
     struct lflow_input lflow_input;
     lflow_get_input_data(node, &lflow_input);
+
+    /* Handle new router datapaths — generate base flows incrementally
+     * using per-datapath lflow_ref, then sync to SB. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node, &northd_data->trk_data.trk_created_lrs) {
+            struct ovn_datapath *od = hmapx_node->data;
+
+            build_lr_flows_for_datapath(od, &lflow_input,
+                                        lflow_data->lflow_table);
+
+            if (!lflow_ref_sync_lflows(
+                    od->lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)
+                || !lflow_ref_sync_lflows(
+                    od->route_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)
+                || !lflow_ref_sync_lflows(
+                    od->policy_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
+            }
+        }
+    }
+
+    /* Handle routers whose static routes changed — rebuild only route flows
+     * using the per-datapath route_lflow_ref. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.lr_with_changed_routes) {
+            struct ovn_datapath *od = hmapx_node->data;
+
+            lflow_ref_unlink_lflows(od->route_lflow_ref);
+            build_lr_route_flows_for_datapath(od, &lflow_input,
+                                              lflow_data->lflow_table);
+            if (!lflow_ref_sync_lflows(
+                    od->route_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
+            }
+        }
+    }
+
+    /* Handle routers whose policies changed — rebuild only policy flows. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_POLICIES) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.lr_with_changed_policies) {
+            struct ovn_datapath *od = hmapx_node->data;
+
+            lflow_ref_unlink_lflows(od->policy_lflow_ref);
+            build_lr_policy_flows_for_datapath(od, &lflow_input,
+                                               lflow_data->lflow_table);
+            if (!lflow_ref_sync_lflows(
+                    od->policy_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
+            }
+        }
+    }
 
     if (!lflow_handle_northd_port_changes(eng_ctx->ovnsb_idl_txn,
                                           &northd_data->trk_data.trk_lsps,

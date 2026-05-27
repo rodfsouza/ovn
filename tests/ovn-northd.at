@@ -12254,10 +12254,9 @@ check ovn-nbctl --wait=sb lsp-add sw0 sw0p1 -- lsp-set-addresses sw0p1 "00:00:20
 
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-add lr0
-# Standalone router creation is handled incrementally by northd.
-# Lflow still recomputes (no per-datapath lflow_ref yet).
+# Standalone router creation is handled incrementally by northd and lflow.
 check_engine_stats northd norecompute compute
-check_engine_stats lflow recompute nocompute
+check_engine_stats lflow norecompute compute
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 # Adding a logical router port should result in recompute
@@ -13648,10 +13647,9 @@ check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 
 check ovn-nbctl --wait=sb lr-add lr1
 
-# Northd handles standalone router creation incrementally.
-# Lflow recomputes (no per-datapath lflow_ref yet).
+# Northd and lflow handle standalone router creation incrementally.
 check_engine_stats northd norecompute compute
-check_engine_stats lflow recompute nocompute
+check_engine_stats lflow norecompute compute
 
 # Verify SB state: new datapath binding exists
 check_row_count Datapath_Binding 3
@@ -13809,15 +13807,17 @@ check ovn-nbctl --wait=sb lr-add lr0
 check ovn-nbctl --wait=sb \
     lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
 
-# Static routes on existing router still trigger recompute
+# Static routes on existing router — handled incrementally
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-route-add lr0 192.168.0.0/16 10.0.0.254
-check_engine_stats northd recompute nocompute
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
 
-# Policies on existing router still trigger recompute
+# Policies on existing router — handled incrementally
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-policy-add lr0 100 "ip4.src == 10.0.0.0/24" allow
-check_engine_stats northd recompute nocompute
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
