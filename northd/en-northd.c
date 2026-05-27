@@ -202,12 +202,17 @@ bool
 northd_nb_logical_router_port_handler(struct engine_node *node,
                                       void *data)
 {
+    const struct engine_context *eng_ctx = engine_get_context();
     struct northd_data *nd = data;
     struct northd_input input_data;
 
     northd_get_input_data(node, &input_data);
 
-    if (!northd_handle_lrp_changes(&input_data, nd)) {
+    const struct nbrec_logical_router_port_table *lrp_table =
+        EN_OVSDB_GET(engine_get_input("nb_logical_router_port", node));
+
+    if (!northd_handle_lrp_changes(eng_ctx->ovnsb_idl_txn,
+                                   lrp_table, &input_data, nd)) {
         return false;
     }
 

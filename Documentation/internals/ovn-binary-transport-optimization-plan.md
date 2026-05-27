@@ -35,19 +35,62 @@
 | Router + LB (same txn) | recompute | recompute | LB fallback |
 | Router delete with ports | recompute | recompute | Ports/lr_group fallback |
 
-### Remaining Work
+### Planned Phases (C.8-C.11)
 
-1. **LRP handler on existing routers**: `northd_handle_lrp_changes()` returns false. Full implementation needs: port lookup via `lr_ports`, `ovn_port_create()`, `ovn_port_update_sbrec()`, per-LRP flow generation, peer port linking.
+| Phase | Description | Complexity | Prerequisite |
+|-------|-------------|------------|--------------|
+| **C.11** | LB on new router — `ovn_lb_datapaths_add_lr()` | Low | None |
+| **C.8** | LRP add/delete on existing routers | Medium | None |
+| **C.10** | Router deletion with ports | Medium | C.8 (same cleanup pattern) |
+| **C.9** | DGW Tier 1 — cr- port on new routers only | High | C.8 |
 
-2. **Router deletion with ports**: Requires iterating `od->ports`, deleting each port's SB `port_binding`, unlinking per-port `lflow_ref`, cleaning `lr_group` back-references.
+**Recommended order**: C.11 → C.8 → C.10 → C.9
 
-3. **DGW port support**: `create_cr_port()` creates chassis-redirect derived ports with complex HA chassis group handling. Deferred indefinitely.
+### C.8: LRP Add/Delete on Existing Routers
 
-4. **LB on new router**: `build_lb_datapaths()` associates LBs with routers. Not yet called incrementally.
+- **Parent lookup**: Iterate `lr_datapaths` × `nbr->ports[]` to find parent router (O(R×P), R is small)
+- **New LRP**: `ovn_port_create()` + `extract_lrp_networks()` + `ovn_port_allocate_key()` + `ovn_port_update_sbrec()`. Reject DGW ports.
+- **Deleted LRP**: `lflow_ref_clear()` + `sbrec_port_binding_delete()` + `hmap_remove()` + `ovn_port_destroy_orphan()`. Reject if has `cr_port`.
+- **Modified LRP**: Falls back to recompute (MAC/IP changes affect many builders)
+- **Peer port**: Find peer LSP in `ls_ports`, set bidirectional `op->peer`, mark peer as updated in `trk_lsps`
+- **Lflow handler**: `build_lswitch_and_lrouter_iterate_by_lrp()` + `lflow_ref_sync_lflows(op->lflow_ref)` for created; `lflow_ref_resync_flows()` for deleted
 
-5. **Binary XOR** (Phase D): Add `ovsdb_datum_apply_diff_in_place()` support to `ovsdb_idl_binary_row_change()`.
+### C.9: DGW Port Support (Tier 1 — New Routers Only)
 
-6. **Batch accumulation** (Phase E): Accumulate binary frames before `engine_run()`.
+- Remove DGW fallback in C.6 for new router creation
+- Create cr- port via `ovn_chassis_redirect_name()` + `ovn_port_create()`
+- Set `crp->primary_port = op; op->cr_port = crp; crp->od = od`
+- Add to `od->l3dgw_ports[]` array
+- Insert SB `port_binding` for cr- port
+- DGW on existing routers remains fallback
+
+### C.10: Router Deletion with Ports
+
+- Extend current deletion code to handle `!hmap_is_empty(&od->ports)`
+- Iterate `HMAP_FOR_EACH_SAFE(op, dp_node, &od->ports)`:
+  - Clean cr_port if exists (lflow_ref_clear + SB delete + destroy)
+  - Disconnect peer (`op->peer->peer = NULL`)
+  - `lflow_ref_clear()` + SB port_binding delete + hmap_remove + destroy orphan
+- Clean single-member `lr_group`
+- Fall back if `lr_group->n_router_dps > 1` (multi-router group)
+
+### C.11: LB on New Router
+
+- Remove `n_load_balancer > 0` fallback
+- Iterate `changed_lr->load_balancer[]`:
+  - Find existing `ovn_lb_datapaths` via `ovn_lb_datapaths_find()`
+  - Call `ovn_lb_datapaths_add_lr(lb_dps, 1, &od)` to add router to bitmap
+  - Track in `trk_lbs.crupdated` + set `NORTHD_TRACKED_LBS`
+- LB groups: same pattern via `ovn_lb_group_datapaths_find()` + iterate group's LBs
+- Reuses existing incremental LB lflow handler
+
+### Remaining Future Work
+
+1. **LRP modify** on existing routers: Falls back (MAC/IP changes complex)
+2. **DGW on existing routers** (C.9 Tier 2): Full `create_cr_port()` in LRP handler
+3. **Multi-router group deletion**: `lr_group->n_router_dps > 1` requires recursive group rebuild
+4. **Binary XOR** (Phase D): `ovsdb_datum_apply_diff_in_place()` support
+5. **Batch accumulation** (Phase E): Accumulate binary frames before `engine_run()`
 
 ---
 

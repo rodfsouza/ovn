@@ -13729,12 +13729,12 @@ check ovn-nbctl --wait=sb lr-add lr1
 check_engine_stats northd norecompute compute
 check_row_count Datapath_Binding 2
 
-# ---- Step 2: Add port to existing router (triggers recompute) ----
+# ---- Step 2: Add port to existing router (incremental via LRP handler) ----
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb \
     lrp-add lr1 rp1 00:00:00:00:00:02 10.1.0.1/24
 
-check_engine_stats northd recompute nocompute
+check_engine_stats northd norecompute compute
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
@@ -13820,6 +13820,92 @@ check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-policy-add lr0 100 "ip4.src == 10.0.0.0/24" allow
 check_engine_stats northd norecompute compute
 check_engine_stats lflow norecompute compute
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- incremental LRP add on existing router])
+AT_KEYWORDS([incremental lrp-add])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+check_engine_stats northd norecompute compute
+wait_row_count Port_Binding 1 logical_port=rp0
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- incremental LRP delete on existing router])
+AT_KEYWORDS([incremental lrp-del])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lrp-del rp0
+
+check_engine_stats northd norecompute compute
+check_row_count Port_Binding 0
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- incremental deletion of router with ports])
+AT_KEYWORDS([incremental lr-del-ports])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0 \
+    -- lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+check_row_count Datapath_Binding 1
+wait_row_count Port_Binding 1 logical_port=rp0
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-del lr0
+
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 0
+check_row_count Port_Binding 0
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- router creation with load balancer])
+AT_KEYWORDS([incremental lr-create-lb])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lb-add lb1 10.0.0.100:80 10.0.0.1:80
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-add lr1 -- lr-lb-add lr1 lb1
+
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 1
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 

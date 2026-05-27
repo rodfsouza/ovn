@@ -705,7 +705,9 @@ bool northd_handle_ls_changes(struct ovsdb_idl_txn *,
 bool northd_handle_lr_changes(struct ovsdb_idl_txn *,
                               const struct northd_input *,
                               struct northd_data *);
-bool northd_handle_lrp_changes(const struct northd_input *,
+bool northd_handle_lrp_changes(struct ovsdb_idl_txn *,
+                               const struct nbrec_logical_router_port_table *,
+                               const struct northd_input *,
                                struct northd_data *);
 void destroy_northd_data_tracked_changes(struct northd_data *);
 void northd_destroy(struct northd_data *data);
