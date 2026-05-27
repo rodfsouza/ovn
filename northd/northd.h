@@ -113,6 +113,18 @@ struct tracked_lbs {
     struct hmapx deleted;
 };
 
+struct tracked_lr_ports {
+    /* Tracked created LRPs on existing routers.
+     * hmapx node data is 'struct ovn_port *' — alive, flows to generate. */
+    struct hmapx created;
+
+    /* Tracked deleted LRPs on existing routers.
+     * hmapx node data is 'struct ovn_port *' — removed from operational
+     * hmaps (lr_ports, od->ports) but kept alive for lflow cleanup.
+     * Destroyed in destroy_northd_data_tracked_changes(). */
+    struct hmapx deleted;
+};
+
 enum northd_tracked_data_type {
     NORTHD_TRACKED_NONE,
     NORTHD_TRACKED_PORTS       = (1 << 0),
@@ -124,6 +136,7 @@ enum northd_tracked_data_type {
     NORTHD_TRACKED_LR_DELETED  = (1 << 6),
     NORTHD_TRACKED_LR_ROUTES  = (1 << 7),
     NORTHD_TRACKED_LR_POLICIES = (1 << 8),
+    NORTHD_TRACKED_LR_PORTS    = (1 << 9),
 };
 
 /* Track what's changed in the northd engine node.
@@ -133,6 +146,7 @@ struct northd_tracked_data {
     /* Indicates the type of data tracked.  One or all of NORTHD_TRACKED_*. */
     enum northd_tracked_data_type type;
     struct tracked_ovn_ports trk_lsps;
+    struct tracked_lr_ports trk_lrps;
     struct tracked_lbs trk_lbs;
 
     /* Tracked logical routers whose NATs have changed.
@@ -737,6 +751,10 @@ bool lflow_handle_northd_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
                                       struct tracked_ovn_ports *,
                                       struct lflow_input *,
                                       struct lflow_table *lflows);
+bool lflow_handle_northd_lr_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
+                                          struct tracked_lr_ports *,
+                                          struct lflow_input *,
+                                          struct lflow_table *lflows);
 bool lflow_handle_northd_lb_changes(struct ovsdb_idl_txn *ovnsb_txn,
                                     struct tracked_lbs *,
                                     struct lflow_input *,

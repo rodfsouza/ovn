@@ -17,9 +17,11 @@ Binary transport optimization (Phase A) is documented in the OVS repo at
 | **C.5** | **DONE** | OVN `7d413942f` | Incremental static route handling via `od->route_lflow_ref`. |
 | **C.6** | **DONE** | OVN `4987eb03c` | Router + ports in same txn. Inline LRP creation. |
 | **C.7** | **DONE** | OVN `7d413942f` | Incremental policy handling via `od->policy_lflow_ref`. |
-| **C.8** | **DONE** | OVN `69da4c94b` | LRP add/delete on existing routers. Parent lookup via `lr_datapaths` iteration. Reject DGW/modify. |
-| **C.10** | **DONE** | OVN `69da4c94b` | Router deletion with ports. Iterates `od->ports`, cleans cr_port/peer/SB. Single-member `lr_group` cleanup. |
-| **C.11** | **DONE** | OVN `69da4c94b` | LB on new router via `ovn_lb_datapaths_add_lr()`. LB groups via `ovn_lb_group_datapaths_add_lr()`. |
+| **C.8** | **PARTIAL** | OVN `69da4c94b`, reverted `3ab7968` | northd creates/deletes port+SB but returns false for lflow recompute. Per-LRP lflow tracking not yet implemented. |
+| **C.10** | **DONE** | OVN `69da4c94b` | Router deletion with ports. Iterates `od->ports`, cleans cr_port/peer/SB. Single-member `lr_group` cleanup. Lflow returns false (recompute). |
+| **C.11** | **REVERTED** | OVN `69da4c94b`, reverted `3ab7968` | LB association removed due to bitmap OOB in `ovn_lb_datapaths.nb_lr_map`. Bitmap allocated to old router count; new router's `od->index` writes past boundary. |
+| **C.11.1** | NOT STARTED | — | Fix: lazy bitmap resize in `ovn_lb_datapaths_add_lr()` + array resize in `ovn_lb_group_datapaths_add_lr()`. |
+| **C.8.1** | NOT STARTED | — | Fix: per-LRP lflow tracking (`tracked_lr_ports` struct), peer resolution, incremental flow generation via `build_lswitch_and_lrouter_iterate_by_lrp()` + `build_lbnat_lflows_iterate_by_lrp()`. |
 | **C.9** | NOT STARTED | — | DGW Tier 1 — cr- port on new routers. |
 | **D** | NOT STARTED | — | Binary UPDATE_BATCH with direct datum path. XOR support needed. |
 | **E** | NOT STARTED | — | Streaming-aware batch processing. |
@@ -28,10 +30,11 @@ Binary transport optimization (Phase A) is documented in the OVS repo at
 
 | Operation | northd | lflow | Phase |
 |-----------|--------|-------|-------|
-| Router add (any config, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6+C.11 |
-| Router + ports + NAT + routes + policies + LB | **norecompute** | **norecompute** | C.6+C.5+C.7+C.11 |
-| LRP add on existing router (no DGW) | **norecompute** | recompute | C.8 |
-| LRP delete on existing router (no DGW) | **norecompute** | recompute | C.8 |
+| Router add (no LB, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6 |
+| Router + ports + NAT + routes + policies | **norecompute** | **norecompute** | C.6+C.5+C.7 |
+| Router + LB | recompute | recompute | C.11 reverted |
+| LRP add on existing router (no DGW) | recompute | recompute | C.8 (returns false) |
+| LRP delete on existing router (no DGW) | recompute | recompute | C.8 (returns false) |
 | Router delete (with/without ports) | **norecompute** | recompute | C.10 |
 | Static route change | **norecompute** | **norecompute** | C.5 |
 | Policy change | **norecompute** | **norecompute** | C.7 |
@@ -42,12 +45,31 @@ Binary transport optimization (Phase A) is documented in the OVS repo at
 | Multi-router group deletion | recompute | recompute | Fallback |
 | Disabled router | recompute | recompute | Fallback |
 
+### Review Fixes Needed (from commit 3ab7968)
+
+Three issues were found in review and fixed by reverting to fallback:
+
+1. **C.11 bitmap OOB**: `ovn_lb_datapaths.nb_lr_map` allocated with old router count.
+   New router `od->index >= old_count` writes past bitmap boundary. Fix: add
+   `nb_lr_map_n_bits` field, lazy resize in `ovn_lb_datapaths_add_lr()`.
+
+2. **C.8 LRP create lflow signaling**: Set `NORTHD_TRACKED_LR_CREATED` without
+   populating `trk_created_lrs` hmapx. Lflow handler looped empty hmapx, generated
+   no flows. Fix: add `tracked_lr_ports` struct with per-LRP tracking, generate flows
+   via `build_lswitch_and_lrouter_iterate_by_lrp()`.
+
+3. **C.8 LRP delete lflow signaling**: Set `NORTHD_TRACKED_LR_DELETED` misleadingly.
+   Fix: keep port alive for `lflow_ref_resync_flows()`, same pattern as LSP delete.
+
 ### Remaining Future Work
 
-1. **C.9 — DGW Tier 1**: Create cr- port on new routers via `ovn_chassis_redirect_name()` + `ovn_port_create()`. Populate `od->l3dgw_ports[]`. DGW on existing routers remains fallback.
-2. **LRP modify**: MAC/IP changes affect many flow builders — complex to handle incrementally.
-3. **Multi-router group deletion**: `lr_group->n_router_dps > 1` requires recursive group rebuild.
-4. **Binary XOR** (Phase D): `ovsdb_datum_apply_diff_in_place()` support.
+1. **C.11.1 — LB bitmap resize**: Lazy resize in `ovn_lb_datapaths_add_lr()` + restore LB association block.
+2. **C.8.1 — Per-LRP lflow tracking**: `tracked_lr_ports` struct, peer resolution, incremental flow gen.
+3. **C.9 — DGW Tier 1**: Create cr- port on new routers via `ovn_chassis_redirect_name()` + `ovn_port_create()`. Populate `od->l3dgw_ports[]`. DGW on existing routers remains fallback.
+4. **LRP modify**: MAC/IP changes affect many flow builders — complex to handle incrementally.
+5. **Multi-router group deletion**: `lr_group->n_router_dps > 1` requires recursive group rebuild.
+6. **Router deletion lflow**: Currently returns false in lflow handler. Needs datapath kept alive for `lflow_ref_resync_flows()`.
+7. **Binary XOR** (Phase D): `ovsdb_datum_apply_diff_in_place()` support.
 5. **Batch accumulation** (Phase E): Accumulate binary frames before `engine_run()`.
 
 ---

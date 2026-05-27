@@ -254,20 +254,21 @@ AFTER:
 
 ### Incremental vs Recompute Behavior
 
-| Operation | northd | lflow | Phase |
-|-----------|--------|-------|-------|
-| Router add (any config, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6+C.11 |
-| Router + ports + NAT + routes + policies + LB | **norecompute** | **norecompute** | C.6+C.5+C.7+C.11 |
-| LRP add on existing router (no DGW) | **norecompute** | recompute | C.8 |
-| LRP delete on existing router (no DGW) | **norecompute** | recompute | C.8 |
-| Router delete (with/without ports) | **norecompute** | recompute | C.10 |
-| Static route change | **norecompute** | **norecompute** | C.5 |
-| Policy change | **norecompute** | **norecompute** | C.7 |
-| NAT modify (existing) | **norecompute** | recompute | Existing |
-| LB modify (existing) | **norecompute** | **norecompute** | Existing |
-| LRP modify (MAC/IP change) | recompute | recompute | Fallback |
-| DGW port changes | recompute | recompute | Fallback |
-| Multi-router group deletion | recompute | recompute | Fallback |
+| Operation | northd | lflow | Phase | Notes |
+|-----------|--------|-------|-------|-------|
+| Router add (no LB, no DGW) | **norecompute** | **norecompute** | C.1+C.4+C.6 | |
+| Router + ports + NAT + routes + policies | **norecompute** | **norecompute** | C.6+C.5+C.7 | |
+| Router + LB | recompute | recompute | C.11 reverted | Bitmap OOB — needs C.11.1 |
+| LRP add on existing router (no DGW) | recompute | recompute | C.8 partial | Creates port+SB, returns false — needs C.8.1 |
+| LRP delete on existing router (no DGW) | recompute | recompute | C.8 partial | Deletes port+SB, returns false — needs C.8.1 |
+| Router delete (with/without ports) | **norecompute** | recompute | C.10 | Lflow returns false (future: keep OD alive for resync) |
+| Static route change | **norecompute** | **norecompute** | C.5 | |
+| Policy change | **norecompute** | **norecompute** | C.7 | |
+| NAT modify (existing) | **norecompute** | recompute | Existing | |
+| LB modify (existing) | **norecompute** | **norecompute** | Existing | |
+| LRP modify (MAC/IP change) | recompute | recompute | Fallback | |
+| DGW port changes | recompute | recompute | Fallback | |
+| Multi-router group deletion | recompute | recompute | Fallback | |
 
 ### Tunnel Key Allocation Strategy
 
@@ -293,18 +294,21 @@ and `ls_datapaths` (tunnel keys must be unique across routers AND switches):
 
 ### Fallback Strategy
 
-Complex router creation falls back to full recompute:
+Router creation falls back to full recompute only for:
 
 ```c
-if (changed_lr->n_ports > 0       // Has ports in same transaction
-    || changed_lr->n_nat > 0      // Has NAT rules
-    || changed_lr->n_load_balancer > 0  // Has load balancers
-    || changed_lr->n_policies > 0      // Has routing policies
-    || changed_lr->n_static_routes > 0 // Has static routes
-    || !lrouter_is_enabled(changed_lr)) { // Disabled router
+if (changed_lr->n_load_balancer > 0      // LB bitmap OOB (C.11 reverted)
+    || changed_lr->n_load_balancer_group > 0  // Same issue
+    || !lrouter_is_enabled(changed_lr)   // Disabled router
+    || has_dgw_ports(changed_lr)) {      // DGW ports (complex cr- creation)
     goto fail;  // Full recompute — safe, correct
 }
 ```
+
+Ports, NATs, routes, and policies on new routers are handled incrementally.
+LRP add/delete on existing routers creates/deletes the port and SB binding
+incrementally but then returns false to trigger lflow recompute (per-LRP
+lflow tracking is not yet implemented — planned in C.8.1).
 
 ## 3. Engine Nodes for Router Sub-Tables (Phase C.2)
 
@@ -620,6 +624,36 @@ When a route changes:
 
 ## 6. Future Work
 
+### C.11.1: LB Bitmap Resize (Next)
+
+**Problem**: `ovn_lb_datapaths.nb_lr_map` allocated with old router count.
+When a new router is created incrementally, `od->index` can exceed the bitmap
+boundary, causing OOB write in `bitmap_set1()`.
+
+**Fix**: Add `nb_lr_map_n_bits` field to `struct ovn_lb_datapaths`. In
+`ovn_lb_datapaths_add_lr()`, check `ods[i]->index >= lb_dps->nb_lr_map_n_bits`
+and `xrealloc` + `memset` the bitmap to the new size. Same pattern for
+`ovn_lb_group_datapaths` (add `max_lr` field, realloc `lr[]` array).
+
+Then restore the LB association block in `northd_handle_lr_changes()` and
+remove the `n_load_balancer > 0` fallback.
+
+### C.8.1: Per-LRP Incremental Lflow Tracking (Next)
+
+**Problem**: LRP create/delete handler creates/deletes the port and SB
+port_binding correctly but returns false to trigger full lflow recompute,
+because per-LRP lflow tracking was not implemented.
+
+**Fix**: Follow the `tracked_ovn_ports` (LSP) pattern:
+1. Add `tracked_lr_ports` struct with `created`/`deleted` hmapx fields
+2. Add `NORTHD_TRACKED_LR_PORTS` enum value (1 << 9)
+3. LRP create: resolve peer LSP via `ls_ports` scan, add to `trk_lrps.created`
+4. LRP delete: keep port alive (don't destroy), add to `trk_lrps.deleted`
+5. Lflow handler: for created, call `build_lswitch_and_lrouter_iterate_by_lrp()`
+   + `build_lbnat_lflows_iterate_by_lrp()` + sync both `lflow_ref` and
+   `stateful_lflow_ref`. For deleted, call `lflow_ref_resync_flows()` on both refs.
+6. Port destroyed in `destroy_northd_data_tracked_changes()` (same as LSP pattern)
+
 ### C.9: DGW Port Support (Tier 1 — New Routers Only)
 
 Create cr- port on new routers via `ovn_chassis_redirect_name()` +
@@ -627,6 +661,13 @@ Create cr- port on new routers via `ovn_chassis_redirect_name()` +
 Populate `od->l3dgw_ports[]`. Insert SB port_binding for cr- port.
 DGW on existing routers remains fallback due to complexity of
 HA chassis group handling and 40+ downstream flow generation sites.
+
+### Router Deletion Lflow
+
+Currently `lflow_northd_handler` returns false for `NORTHD_TRACKED_LR_DELETED`.
+To make this incremental, need to keep the deleted `ovn_datapath` alive (in
+`trk_deleted_lrs`) until lflow handler calls `lflow_ref_resync_flows()` on
+all 3 per-datapath refs. Same deferred-destruction pattern as LRP/LSP.
 
 ### LRP Modify on Existing Routers
 
