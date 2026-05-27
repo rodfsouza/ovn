@@ -57,6 +57,10 @@ static unixctl_cb_func chassis_features_list;
     NB_NODE(load_balancer_group, "load_balancer_group") \
     NB_NODE(acl, "acl") \
     NB_NODE(logical_router, "logical_router") \
+    NB_NODE(logical_router_port, "logical_router_port") \
+    NB_NODE(logical_router_static_route, "logical_router_static_route") \
+    NB_NODE(logical_router_policy, "logical_router_policy") \
+    NB_NODE(nat, "nat") \
     NB_NODE(mirror, "mirror") \
     NB_NODE(meter, "meter") \
     NB_NODE(bfd, "bfd") \
@@ -212,6 +216,17 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
                      northd_nb_logical_switch_handler);
     engine_add_input(&en_northd, &en_nb_logical_router,
                      northd_nb_logical_router_handler);
+
+    /* Router sub-table inputs.  NULL handlers mean any change to these
+     * tables triggers a full northd recompute.  Future work will add
+     * incremental handlers that use lr_ports hmap lookup (op->od) to
+     * map sub-object changes back to their parent router. */
+    engine_add_input(&en_northd, &en_nb_logical_router_port,
+                     northd_nb_logical_router_port_handler);
+    engine_add_input(&en_northd, &en_nb_logical_router_static_route, NULL);
+    engine_add_input(&en_northd, &en_nb_logical_router_policy, NULL);
+    engine_add_input(&en_northd, &en_nb_nat, NULL);
+
     engine_add_input(&en_northd, &en_lb_data, northd_lb_data_handler);
 
     engine_add_input(&en_lr_nat, &en_northd, lr_nat_northd_handler);

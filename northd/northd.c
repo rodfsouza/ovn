@@ -455,6 +455,9 @@ ovn_datapath_create(struct hmap *datapaths, const struct uuid *key,
     od->lr_group = NULL;
     hmap_init(&od->ports);
     sset_init(&od->router_ips);
+    od->lflow_ref = lflow_ref_create();
+    od->route_lflow_ref = lflow_ref_create();
+    od->policy_lflow_ref = lflow_ref_create();
     return od;
 }
 
@@ -484,6 +487,9 @@ ovn_datapath_destroy(struct hmap *datapaths, struct ovn_datapath *od)
         destroy_mcast_info_for_datapath(od);
         destroy_ports_for_datapath(od);
         sset_destroy(&od->router_ips);
+        lflow_ref_destroy(od->lflow_ref);
+        lflow_ref_destroy(od->route_lflow_ref);
+        lflow_ref_destroy(od->policy_lflow_ref);
         free(od);
     }
 }
@@ -4319,10 +4325,21 @@ destroy_northd_data_tracked_changes(struct northd_data *nd)
 {
     struct northd_tracked_data *trk_changes = &nd->trk_data;
     destroy_tracked_ovn_ports(&trk_changes->trk_lsps);
+    /* Destroy tracked LRPs — deleted ports are kept alive until now. */
+    struct hmapx_node *hmapx_node_lrp;
+    HMAPX_FOR_EACH_SAFE (hmapx_node_lrp, &trk_changes->trk_lrps.deleted) {
+        ovn_port_destroy_orphan(hmapx_node_lrp->data);
+        hmapx_delete(&trk_changes->trk_lrps.deleted, hmapx_node_lrp);
+    }
+    hmapx_clear(&trk_changes->trk_lrps.created);
     destroy_tracked_lbs(&trk_changes->trk_lbs);
     hmapx_clear(&trk_changes->trk_nat_lrs);
     hmapx_clear(&trk_changes->ls_with_changed_lbs);
     hmapx_clear(&trk_changes->ls_with_changed_acls);
+    hmapx_clear(&trk_changes->trk_created_lrs);
+    hmapx_clear(&trk_changes->trk_deleted_lrs);
+    hmapx_clear(&trk_changes->lr_with_changed_routes);
+    hmapx_clear(&trk_changes->lr_with_changed_policies);
     trk_changes->type = NORTHD_TRACKED_NONE;
 }
 
@@ -4334,11 +4351,17 @@ init_northd_tracked_data(struct northd_data *nd)
     hmapx_init(&trk_data->trk_lsps.created);
     hmapx_init(&trk_data->trk_lsps.updated);
     hmapx_init(&trk_data->trk_lsps.deleted);
+    hmapx_init(&trk_data->trk_lrps.created);
+    hmapx_init(&trk_data->trk_lrps.deleted);
     hmapx_init(&trk_data->trk_lbs.crupdated);
     hmapx_init(&trk_data->trk_lbs.deleted);
     hmapx_init(&trk_data->trk_nat_lrs);
     hmapx_init(&trk_data->ls_with_changed_lbs);
     hmapx_init(&trk_data->ls_with_changed_acls);
+    hmapx_init(&trk_data->trk_created_lrs);
+    hmapx_init(&trk_data->trk_deleted_lrs);
+    hmapx_init(&trk_data->lr_with_changed_routes);
+    hmapx_init(&trk_data->lr_with_changed_policies);
 }
 
 static void
@@ -4349,11 +4372,17 @@ destroy_northd_tracked_data(struct northd_data *nd)
     hmapx_destroy(&trk_data->trk_lsps.created);
     hmapx_destroy(&trk_data->trk_lsps.updated);
     hmapx_destroy(&trk_data->trk_lsps.deleted);
+    hmapx_destroy(&trk_data->trk_lrps.created);
+    hmapx_destroy(&trk_data->trk_lrps.deleted);
     hmapx_destroy(&trk_data->trk_lbs.crupdated);
     hmapx_destroy(&trk_data->trk_lbs.deleted);
     hmapx_destroy(&trk_data->trk_nat_lrs);
     hmapx_destroy(&trk_data->ls_with_changed_lbs);
     hmapx_destroy(&trk_data->ls_with_changed_acls);
+    hmapx_destroy(&trk_data->trk_created_lrs);
+    hmapx_destroy(&trk_data->trk_deleted_lrs);
+    hmapx_destroy(&trk_data->lr_with_changed_routes);
+    hmapx_destroy(&trk_data->lr_with_changed_policies);
 }
 
 /* Check if a changed LSP can be handled incrementally within the I-P engine
@@ -4891,7 +4920,9 @@ lr_changes_can_be_handled(const struct nbrec_logical_router *lr)
         if (nbrec_logical_router_is_updated(lr, col)) {
             if (col == NBREC_LOGICAL_ROUTER_COL_LOAD_BALANCER
                 || col == NBREC_LOGICAL_ROUTER_COL_LOAD_BALANCER_GROUP
-                || col == NBREC_LOGICAL_ROUTER_COL_NAT) {
+                || col == NBREC_LOGICAL_ROUTER_COL_NAT
+                || col == NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES
+                || col == NBREC_LOGICAL_ROUTER_COL_POLICIES) {
                 continue;
             }
             return false;
@@ -4899,28 +4930,14 @@ lr_changes_can_be_handled(const struct nbrec_logical_router *lr)
     }
 
     /* Check if the referenced rows are changed.
-       XXX: Need a better OVSDB IDL interface for this check. */
-    for (size_t i = 0; i < lr->n_ports; i++) {
-        if (nbrec_logical_router_port_row_get_seqno(lr->ports[i],
-                                OVSDB_IDL_CHANGE_MODIFY) > 0) {
-            return false;
-        }
-    }
+       XXX: Need a better OVSDB IDL interface for this check.
+       Note: LRP changes are now handled by the dedicated
+       en_nb_logical_router_port engine node.
+       Static route and policy changes are handled via
+       is_lr_static_routes_changed() / is_lr_policies_changed(). */
     if (lr->copp && nbrec_copp_row_get_seqno(lr->copp,
                                 OVSDB_IDL_CHANGE_MODIFY) > 0) {
         return false;
-    }
-    for (size_t i = 0; i < lr->n_policies; i++) {
-        if (nbrec_logical_router_policy_row_get_seqno(lr->policies[i],
-                                OVSDB_IDL_CHANGE_MODIFY) > 0) {
-            return false;
-        }
-    }
-    for (size_t i = 0; i < lr->n_static_routes; i++) {
-        if (nbrec_logical_router_static_route_row_get_seqno(
-            lr->static_routes[i], OVSDB_IDL_CHANGE_MODIFY) > 0) {
-            return false;
-        }
     }
     return true;
 }
@@ -4947,6 +4964,46 @@ is_lr_nats_changed(const struct nbrec_logical_router *nbr) {
             || is_lr_nats_seqno_changed(nbr));
 }
 
+static bool
+is_lr_static_routes_seqno_changed(const struct nbrec_logical_router *nbr)
+{
+    for (size_t i = 0; i < nbr->n_static_routes; i++) {
+        if (nbrec_logical_router_static_route_row_get_seqno(
+                nbr->static_routes[i], OVSDB_IDL_CHANGE_MODIFY) > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+is_lr_static_routes_changed(const struct nbrec_logical_router *nbr)
+{
+    return nbrec_logical_router_is_updated(
+               nbr, NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES)
+           || is_lr_static_routes_seqno_changed(nbr);
+}
+
+static bool
+is_lr_policies_seqno_changed(const struct nbrec_logical_router *nbr)
+{
+    for (size_t i = 0; i < nbr->n_policies; i++) {
+        if (nbrec_logical_router_policy_row_get_seqno(
+                nbr->policies[i], OVSDB_IDL_CHANGE_MODIFY) > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+is_lr_policies_changed(const struct nbrec_logical_router *nbr)
+{
+    return nbrec_logical_router_is_updated(
+               nbr, NBREC_LOGICAL_ROUTER_COL_POLICIES)
+           || is_lr_policies_seqno_changed(nbr);
+}
+
 /* Return true if changes are handled incrementally, false otherwise.
  *
  * Note: Changes to load balancer and load balancer groups associated with
@@ -4954,16 +5011,290 @@ is_lr_nats_changed(const struct nbrec_logical_router *nbr) {
  * handler -  northd_handle_lb_data_changes().
  * */
 bool
-northd_handle_lr_changes(const struct northd_input *ni,
+northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                         const struct northd_input *ni,
                          struct northd_data *nd)
 {
     const struct nbrec_logical_router *changed_lr;
 
     NBREC_LOGICAL_ROUTER_TABLE_FOR_EACH_TRACKED (changed_lr,
                                              ni->nbrec_logical_router_table) {
-        if (nbrec_logical_router_is_new(changed_lr) ||
-            nbrec_logical_router_is_deleted(changed_lr)) {
-            goto fail;
+        if (nbrec_logical_router_is_new(changed_lr)) {
+            /* Incremental handling of router creation.
+             * Supports routers with ports, NATs, routes, policies, LBs.
+             * Falls back only for disabled routers. */
+            if (!lrouter_is_enabled(changed_lr)) {
+                goto fail;
+            }
+
+            /* Check for DGW ports — too complex for incremental. */
+            for (size_t i = 0; i < changed_lr->n_ports; i++) {
+                if (changed_lr->ports[i]->ha_chassis_group
+                    || changed_lr->ports[i]->n_gateway_chassis) {
+                    goto fail;
+                }
+            }
+
+            /* Verify not already in lr_datapaths. */
+            if (ovn_datapath_find_(&nd->lr_datapaths.datapaths,
+                                   &changed_lr->header_.uuid)) {
+                goto fail;
+            }
+
+            /* Create the datapath. */
+            struct ovn_datapath *od = ovn_datapath_create(
+                &nd->lr_datapaths.datapaths, &changed_lr->header_.uuid,
+                NULL, changed_lr, NULL);
+
+            /* Initialize multicast info. */
+            init_mcast_info_for_datapath(od);
+            if (smap_get(&od->nbr->options, "chassis")) {
+                od->is_gw_router = true;
+            }
+
+            /* Allocate tunnel key by scanning existing datapaths.
+             * Build a temporary set of used tunnel IDs. */
+            struct hmap dp_tnlids = HMAP_INITIALIZER(&dp_tnlids);
+            struct ovn_datapath *iter;
+            HMAP_FOR_EACH (iter, key_node,
+                           &nd->lr_datapaths.datapaths) {
+                if (iter != od && iter->tunnel_key) {
+                    ovn_add_tnlid(&dp_tnlids, iter->tunnel_key);
+                }
+            }
+            HMAP_FOR_EACH (iter, key_node,
+                           &nd->ls_datapaths.datapaths) {
+                if (iter->tunnel_key) {
+                    ovn_add_tnlid(&dp_tnlids, iter->tunnel_key);
+                }
+            }
+
+            /* Try requested tunnel key first. */
+            ovn_datapath_assign_requested_tnl_id(
+                ni->sbrec_chassis_table, &dp_tnlids, od);
+
+            if (!od->tunnel_key) {
+                /* No requested key; allocate a free one. */
+                uint32_t max_key = get_ovn_max_dp_key_local(
+                    ni->sbrec_chassis_table);
+                uint32_t hint = 0;
+                od->tunnel_key = ovn_allocate_tnlid(
+                    &dp_tnlids, "datapath",
+                    OVN_MIN_DP_KEY_LOCAL, max_key, &hint);
+            }
+            ovn_destroy_tnlids(&dp_tnlids);
+
+            if (!od->tunnel_key) {
+                static struct vlog_rate_limit rl =
+                    VLOG_RATE_LIMIT_INIT(1, 1);
+                VLOG_WARN_RL(&rl, "No available tunnel key for new "
+                             "router %s", changed_lr->name);
+                ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
+                goto fail;
+            }
+
+            /* Insert SB datapath_binding record. */
+            od->sb = sbrec_datapath_binding_insert(ovnsb_idl_txn);
+            ovn_datapath_update_external_ids(od);
+            sbrec_datapath_binding_set_tunnel_key(od->sb,
+                                                  od->tunnel_key);
+
+            /* Add to lr_list. */
+            ovs_list_push_back(&nd->lr_list, &od->lr_list);
+
+            /* Rebuild array index (new datapath added). */
+            ods_build_array_index(&nd->lr_datapaths);
+
+            /* Resize ALL existing LB bitmaps to the new datapath count.
+             * Required because BITMAP_FOR_EACH_1 callers (in lflow
+             * generation and lb_data handler) use ods_size(lr_datapaths)
+             * as the upper bound, which now includes the new router.
+             * Without this, bitmaps for LBs NOT associated with the new
+             * router could be read out of bounds when the count crosses
+             * a 64-bit word boundary. */
+            struct ovn_lb_datapaths *lb_dps_iter;
+            HMAP_FOR_EACH (lb_dps_iter, hmap_node,
+                           &nd->lb_datapaths_map) {
+                ovn_lb_datapaths_ensure_lr_bitmap_size(
+                    lb_dps_iter, ods_size(&nd->lr_datapaths));
+            }
+
+            /* Process ports on the new router (C.6). */
+            struct sset active_ha_chassis_grps =
+                SSET_INITIALIZER(&active_ha_chassis_grps);
+            for (size_t i = 0; i < changed_lr->n_ports; i++) {
+                const struct nbrec_logical_router_port *nbrp =
+                    changed_lr->ports[i];
+
+                struct lport_addresses lrp_networks;
+                if (!extract_lrp_networks(nbrp, &lrp_networks)) {
+                    sset_destroy(&active_ha_chassis_grps);
+                    goto fail;
+                }
+
+                struct ovn_port *op = ovn_port_create(
+                    &nd->lr_ports, nbrp->name, NULL, nbrp, NULL);
+                op->od = od;
+                op->lrp_networks = lrp_networks;
+                hmap_insert(&od->ports, &op->dp_node,
+                            hash_string(op->key, 0));
+
+                /* Allocate port tunnel key. */
+                if (!ovn_port_allocate_key(ni->sbrec_chassis_table,
+                                           op)) {
+                    sset_destroy(&active_ha_chassis_grps);
+                    goto fail;
+                }
+
+                /* Insert SB port_binding. */
+                op->sb = sbrec_port_binding_insert(ovnsb_idl_txn);
+                sbrec_port_binding_set_logical_port(op->sb, op->key);
+                ovn_port_update_sbrec(
+                    ovnsb_idl_txn,
+                    ni->sbrec_chassis_by_name,
+                    ni->sbrec_chassis_by_hostname,
+                    ni->sbrec_ha_chassis_grp_by_name,
+                    ni->sbrec_mirror_table,
+                    op, NULL, &active_ha_chassis_grps);
+            }
+            sset_destroy(&active_ha_chassis_grps);
+
+            /* Track NATs if present. */
+            if (changed_lr->n_nat > 0) {
+                hmapx_add(&nd->trk_data.trk_nat_lrs, od);
+            }
+
+            /* Track routes if present. */
+            if (changed_lr->n_static_routes > 0) {
+                hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
+            }
+
+            /* Track policies if present. */
+            if (changed_lr->n_policies > 0) {
+                hmapx_add(&nd->trk_data.lr_with_changed_policies, od);
+            }
+
+            /* Associate load balancers with the new router (C.11).
+             * Uses ovn_lb_datapaths_add_lr() to add the router to
+             * each LB's bitmap.  The bitmap is resized lazily if the
+             * new router's index exceeds the old allocation. */
+            for (size_t i = 0; i < changed_lr->n_load_balancer; i++) {
+                const struct uuid *lb_uuid =
+                    &changed_lr->load_balancer[i]->header_.uuid;
+                struct ovn_lb_datapaths *lb_dps =
+                    ovn_lb_datapaths_find(&nd->lb_datapaths_map, lb_uuid);
+                if (lb_dps) {
+                    ovn_lb_datapaths_add_lr(lb_dps, 1, &od);
+                    hmapx_add(&nd->trk_data.trk_lbs.crupdated, lb_dps);
+                }
+            }
+            for (size_t i = 0; i < changed_lr->n_load_balancer_group; i++) {
+                const struct uuid *lbg_uuid =
+                    &changed_lr->load_balancer_group[i]->header_.uuid;
+                struct ovn_lb_group_datapaths *lbg_dps =
+                    ovn_lb_group_datapaths_find(
+                        &nd->lb_group_datapaths_map, lbg_uuid);
+                if (lbg_dps) {
+                    ovn_lb_group_datapaths_add_lr(lbg_dps, od);
+                    for (size_t j = 0; j < lbg_dps->lb_group->n_lbs; j++) {
+                        const struct uuid *lb_uuid2 =
+                            &lbg_dps->lb_group->lbs[j]->nlb->header_.uuid;
+                        struct ovn_lb_datapaths *lb_dps2 =
+                            ovn_lb_datapaths_find(&nd->lb_datapaths_map,
+                                                  lb_uuid2);
+                        if (lb_dps2) {
+                            ovn_lb_datapaths_add_lr(lb_dps2, 1, &od);
+                            hmapx_add(&nd->trk_data.trk_lbs.crupdated,
+                                      lb_dps2);
+                        }
+                    }
+                }
+            }
+            if (!hmapx_is_empty(&nd->trk_data.trk_lbs.crupdated)) {
+                nd->trk_data.type |= NORTHD_TRACKED_LBS;
+            }
+
+            /* Track for downstream handlers. */
+            hmapx_add(&nd->trk_data.trk_created_lrs, od);
+            continue;
+        }
+
+        if (nbrec_logical_router_is_deleted(changed_lr)) {
+            struct ovn_datapath *od = ovn_datapath_find_(
+                &nd->lr_datapaths.datapaths,
+                &changed_lr->header_.uuid);
+            if (!od) {
+                /* Already removed or never tracked. */
+                continue;
+            }
+
+            /* Multi-router groups require recursive rebuild. */
+            if (od->lr_group && od->lr_group->n_router_dps > 1) {
+                goto fail;
+            }
+
+            /* Delete all ports on this router. */
+            struct ovn_port *op;
+            HMAP_FOR_EACH_SAFE (op, dp_node, &od->ports) {
+                /* DGW ports have cr_port — clean that too. */
+                if (op->cr_port) {
+                    lflow_ref_clear(op->cr_port->lflow_ref);
+                    lflow_ref_clear(op->cr_port->stateful_lflow_ref);
+                    if (op->cr_port->sb) {
+                        sbrec_port_binding_delete(op->cr_port->sb);
+                    }
+                    hmap_remove(&nd->lr_ports, &op->cr_port->key_node);
+                    ovn_port_destroy_orphan(op->cr_port);
+                    op->cr_port = NULL;
+                }
+
+                lflow_ref_clear(op->lflow_ref);
+                lflow_ref_clear(op->stateful_lflow_ref);
+
+                if (op->sb) {
+                    sbrec_port_binding_delete(op->sb);
+                }
+
+                if (op->peer) {
+                    op->peer->peer = NULL;
+                }
+
+                hmap_remove(&nd->lr_ports, &op->key_node);
+                hmap_remove(&od->ports, &op->dp_node);
+                ovn_port_destroy_orphan(op);
+            }
+
+            /* Clean single-member lr_group. */
+            if (od->lr_group) {
+                free(od->lr_group->router_dps);
+                sset_destroy(&od->lr_group->ha_chassis_groups);
+                hmapx_destroy(&od->lr_group->tmp_ha_ref_chassis);
+                free(od->lr_group);
+                od->lr_group = NULL;
+            }
+
+            /* Clear datapath lflow refs. */
+            lflow_ref_clear(od->lflow_ref);
+            lflow_ref_clear(od->route_lflow_ref);
+            lflow_ref_clear(od->policy_lflow_ref);
+
+            /* Delete SB datapath_binding. */
+            if (od->sb) {
+                sbrec_datapath_binding_delete(od->sb);
+            }
+
+            /* Remove from lr_list. */
+            ovs_list_remove(&od->lr_list);
+
+            /* Destroy the datapath (removes from lr_datapaths hmap). */
+            ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
+
+            /* Rebuild array index. */
+            ods_build_array_index(&nd->lr_datapaths);
+
+            /* Track deletion for downstream handlers. */
+            nd->trk_data.type |= NORTHD_TRACKED_LR_DELETED;
+            continue;
         }
 
         /* Presently only able to handle load balancer,
@@ -4987,16 +5318,212 @@ northd_handle_lr_changes(const struct northd_input *ni,
 
             hmapx_add(&nd->trk_data.trk_nat_lrs, od);
         }
+
+        if (is_lr_static_routes_changed(changed_lr)) {
+            struct ovn_datapath *od = ovn_datapath_find_(
+                                    &nd->lr_datapaths.datapaths,
+                                    &changed_lr->header_.uuid);
+            if (!od) {
+                goto fail;
+            }
+            hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
+        }
+
+        if (is_lr_policies_changed(changed_lr)) {
+            struct ovn_datapath *od = ovn_datapath_find_(
+                                    &nd->lr_datapaths.datapaths,
+                                    &changed_lr->header_.uuid);
+            if (!od) {
+                goto fail;
+            }
+            hmapx_add(&nd->trk_data.lr_with_changed_policies, od);
+        }
     }
 
     if (!hmapx_is_empty(&nd->trk_data.trk_nat_lrs)) {
         nd->trk_data.type |= NORTHD_TRACKED_LR_NATS;
     }
 
+    if (!hmapx_is_empty(&nd->trk_data.trk_created_lrs)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_CREATED;
+    }
+
+    if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_routes)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES;
+    }
+
+    if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_policies)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_POLICIES;
+    }
+
     return true;
 fail:
     destroy_northd_data_tracked_changes(nd);
     return false;
+}
+
+/* Handle changes to the Logical_Router_Port table.
+ *
+ * Handles LRP creation and deletion incrementally.  Modifications and
+ * DGW ports fall back to full recompute. */
+bool
+northd_handle_lrp_changes(
+    struct ovsdb_idl_txn *ovnsb_idl_txn,
+    const struct nbrec_logical_router_port_table *lrp_table,
+    const struct northd_input *ni,
+    struct northd_data *nd)
+{
+    const struct nbrec_logical_router_port *changed_lrp;
+
+    NBREC_LOGICAL_ROUTER_PORT_TABLE_FOR_EACH_TRACKED (changed_lrp,
+                                                       lrp_table) {
+        if (nbrec_logical_router_port_is_new(changed_lrp)) {
+            /* Check if already processed by C.6 inline path. */
+            if (ovn_port_find(&nd->lr_ports, changed_lrp->name)) {
+                continue;
+            }
+
+            /* Reject DGW ports. */
+            if (changed_lrp->ha_chassis_group
+                || changed_lrp->n_gateway_chassis) {
+                return false;
+            }
+
+            /* Find parent router by iterating lr_datapaths. */
+            struct ovn_datapath *parent_od = NULL;
+            struct ovn_datapath *od_iter;
+            HMAP_FOR_EACH (od_iter, key_node,
+                           &nd->lr_datapaths.datapaths) {
+                for (size_t i = 0; i < od_iter->nbr->n_ports; i++) {
+                    if (od_iter->nbr->ports[i] == changed_lrp) {
+                        parent_od = od_iter;
+                        break;
+                    }
+                }
+                if (parent_od) {
+                    break;
+                }
+            }
+
+            if (!parent_od) {
+                /* Parent not found — new router handled by C.6. */
+                continue;
+            }
+
+            /* Parse networks. */
+            struct lport_addresses lrp_networks;
+            if (!extract_lrp_networks(changed_lrp, &lrp_networks)) {
+                return false;
+            }
+
+            /* Create ovn_port. */
+            struct ovn_port *op = ovn_port_create(
+                &nd->lr_ports, changed_lrp->name,
+                NULL, changed_lrp, NULL);
+            op->od = parent_od;
+            op->lrp_networks = lrp_networks;
+            hmap_insert(&parent_od->ports, &op->dp_node,
+                        hash_string(op->key, 0));
+
+            /* Allocate port tunnel key. */
+            if (!ovn_port_allocate_key(ni->sbrec_chassis_table, op)) {
+                return false;
+            }
+
+            /* Insert SB port_binding. */
+            struct sset active_ha = SSET_INITIALIZER(&active_ha);
+            op->sb = sbrec_port_binding_insert(ovnsb_idl_txn);
+            sbrec_port_binding_set_logical_port(op->sb, op->key);
+            ovn_port_update_sbrec(
+                ovnsb_idl_txn,
+                ni->sbrec_chassis_by_name,
+                ni->sbrec_chassis_by_hostname,
+                ni->sbrec_ha_chassis_grp_by_name,
+                ni->sbrec_mirror_table,
+                op, NULL, &active_ha);
+            sset_destroy(&active_ha);
+
+            /* Resolve peer: find LSP with options:router-port matching
+             * this LRP name. O(LSP_count) but LRP creation is rare.
+             *
+             * If the peer LSP doesn't exist yet (e.g., created in the
+             * same txn), peer will be NULL and flows are generated
+             * without peer — matching what full recompute produces.
+             * In practice, if a router-type LSP is also new in this
+             * txn, lsp_can_be_inc_processed() returns false for
+             * type="router" LSPs, triggering full recompute via
+             * ls_handle_lsp_changes() which establishes peering. */
+            struct ovn_port *peer = NULL;
+            struct ovn_port *lsp_iter;
+            HMAP_FOR_EACH (lsp_iter, key_node, &nd->ls_ports) {
+                if (lsp_iter->nbsp
+                    && !strcmp(smap_get_def(&lsp_iter->nbsp->options,
+                                            "router-port", ""),
+                               changed_lrp->name)) {
+                    peer = lsp_iter;
+                    break;
+                }
+            }
+            if (peer) {
+                op->peer = peer;
+                peer->peer = op;
+                /* Mark peer LSP as updated so its flows referencing
+                 * the new peer LRP get regenerated. */
+                hmapx_add(&nd->trk_data.trk_lsps.updated, peer);
+                nd->trk_data.type |= NORTHD_TRACKED_PORTS;
+            }
+
+            hmapx_add(&nd->trk_data.trk_lrps.created, op);
+            nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
+
+        } else if (nbrec_logical_router_port_is_deleted(changed_lrp)) {
+            struct ovn_port *op = ovn_port_find(
+                &nd->lr_ports, changed_lrp->name);
+            if (!op) {
+                continue;
+            }
+
+            /* Reject DGW ports (have cr_port). */
+            if (op->cr_port) {
+                return false;
+            }
+
+            /* Delete SB port_binding. */
+            if (op->sb) {
+                sbrec_port_binding_delete(op->sb);
+            }
+
+            /* Disconnect peer and mark for flow update. */
+            if (op->peer) {
+                op->peer->peer = NULL;
+                hmapx_add(&nd->trk_data.trk_lsps.updated, op->peer);
+                nd->trk_data.type |= NORTHD_TRACKED_PORTS;
+            }
+
+            /* Remove from operational hmaps but keep alive for lflow
+             * cleanup.  Do NOT call lflow_ref_clear — the lflow handler
+             * needs the refs intact for lflow_ref_resync_flows().
+             * Port is destroyed in destroy_northd_data_tracked_changes.
+             *
+             * Note: op->od still references the parent datapath.  If
+             * the router is also deleted in this cycle, the LR handler
+             * sets NORTHD_TRACKED_LR_DELETED which causes the lflow
+             * handler to return false (full recompute) BEFORE processing
+             * the LRP tracked data, so op->od is never dereferenced
+             * on a freed datapath. */
+            hmap_remove(&nd->lr_ports, &op->key_node);
+            hmap_remove(&op->od->ports, &op->dp_node);
+
+            hmapx_add(&nd->trk_data.trk_lrps.deleted, op);
+            nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
+
+        } else {
+            /* Modified LRP — fall back to recompute. */
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool
@@ -16433,42 +16960,119 @@ build_lswitch_and_lrouter_iterate_by_lr(struct ovn_datapath *od,
                                         struct lswitch_flow_build_info *lsi)
 {
     ovs_assert(od->nbr);
-    build_adm_ctrl_flows_for_lrouter(od, lsi->lflows, NULL);
+
+    /* General router flows → tracked via od->lflow_ref. */
+    build_adm_ctrl_flows_for_lrouter(od, lsi->lflows, od->lflow_ref);
     build_neigh_learning_flows_for_lrouter(od, lsi->lflows, &lsi->match,
                                            &lsi->actions,
-                                           lsi->meter_groups, NULL);
-    build_ND_RA_flows_for_lrouter(od, lsi->lflows, NULL);
-    build_ip_routing_pre_flows_for_lrouter(od, lsi->lflows, NULL);
-    build_static_route_flows_for_lrouter(od, lsi->features,
-                                         lsi->lflows, lsi->lr_ports,
-                                         lsi->bfd_connections,
-                                         NULL);
+                                           lsi->meter_groups,
+                                           od->lflow_ref);
+    build_ND_RA_flows_for_lrouter(od, lsi->lflows, od->lflow_ref);
     build_mcast_lookup_flows_for_lrouter(od, lsi->lflows, &lsi->match,
-                                         &lsi->actions, NULL);
-    build_ingress_policy_flows_for_lrouter(od, lsi->lflows, lsi->lr_ports,
-                                           lsi->bfd_connections, NULL);
-    build_arp_resolve_flows_for_lrouter(od, lsi->lflows, NULL);
+                                         &lsi->actions, od->lflow_ref);
+    build_arp_resolve_flows_for_lrouter(od, lsi->lflows, od->lflow_ref);
     build_check_pkt_len_flows_for_lrouter(od, lsi->lflows, lsi->lr_ports,
                                           &lsi->match, &lsi->actions,
-                                          lsi->meter_groups, NULL,
+                                          lsi->meter_groups,
+                                          od->lflow_ref,
                                           lsi->features);
     build_gateway_redirect_flows_for_lrouter(od, lsi->lflows, &lsi->match,
-                                             &lsi->actions, NULL);
+                                             &lsi->actions, od->lflow_ref);
     build_arp_request_flows_for_lrouter(od, lsi->lflows, &lsi->match,
                                         &lsi->actions,
                                         lsi->meter_groups,
-                                        NULL);
+                                        od->lflow_ref);
     build_lrouter_network_id_flows(od, lsi->lflows, &lsi->match,
-                                   &lsi->actions, NULL);
-    build_misc_local_traffic_drop_flows_for_lrouter(od, lsi->lflows, NULL);
+                                   &lsi->actions, od->lflow_ref);
+    build_misc_local_traffic_drop_flows_for_lrouter(od, lsi->lflows,
+                                                    od->lflow_ref);
+    build_lr_nat_defrag_and_lb_default_flows(od, lsi->lflows,
+                                             od->lflow_ref);
+    build_lrouter_lb_affinity_default_flows(od, lsi->lflows,
+                                            od->lflow_ref);
 
-    build_lr_nat_defrag_and_lb_default_flows(od, lsi->lflows, NULL);
-    build_lrouter_lb_affinity_default_flows(od, lsi->lflows, NULL);
+    /* Route-specific flows → tracked via od->route_lflow_ref. */
+    build_ip_routing_pre_flows_for_lrouter(od, lsi->lflows,
+                                           od->route_lflow_ref);
+    build_static_route_flows_for_lrouter(od, lsi->features,
+                                         lsi->lflows, lsi->lr_ports,
+                                         lsi->bfd_connections,
+                                         od->route_lflow_ref);
+
+    /* Policy-specific flows → tracked via od->policy_lflow_ref. */
+    build_ingress_policy_flows_for_lrouter(od, lsi->lflows, lsi->lr_ports,
+                                           lsi->bfd_connections,
+                                           od->policy_lflow_ref);
 
     /* Default drop rule in lr_out_delivery stage.  See
      * build_egress_delivery_flows_for_lrouter_port() which adds a rule
      * for each router port. */
-    ovn_lflow_add_default_drop(lsi->lflows, od, S_ROUTER_OUT_DELIVERY, NULL);
+    ovn_lflow_add_default_drop(lsi->lflows, od, S_ROUTER_OUT_DELIVERY,
+                               od->lflow_ref);
+}
+
+/* Public wrapper to generate all base router flows for a single datapath.
+ * Used by the lflow incremental handler for new router datapaths. */
+void
+build_lr_flows_for_datapath(struct ovn_datapath *od,
+                            struct lflow_input *input_data,
+                            struct lflow_table *lflows)
+{
+    struct lswitch_flow_build_info lsi = {
+        .ls_datapaths = input_data->ls_datapaths,
+        .lr_datapaths = input_data->lr_datapaths,
+        .ls_ports = input_data->ls_ports,
+        .lr_ports = input_data->lr_ports,
+        .ls_port_groups = input_data->ls_port_groups,
+        .lr_stateful_table = input_data->lr_stateful_table,
+        .ls_stateful_table = input_data->ls_stateful_table,
+        .lflows = lflows,
+        .meter_groups = input_data->meter_groups,
+        .lb_dps_map = input_data->lb_datapaths_map,
+        .svc_monitor_map = input_data->svc_monitor_map,
+        .bfd_connections = input_data->bfd_connections,
+        .features = input_data->features,
+    };
+    ds_init(&lsi.match);
+    ds_init(&lsi.actions);
+
+    build_lswitch_and_lrouter_iterate_by_lr(od, &lsi);
+
+    ds_destroy(&lsi.match);
+    ds_destroy(&lsi.actions);
+}
+
+/* Public wrapper to rebuild only route-specific flows for a single router. */
+void
+build_lr_route_flows_for_datapath(struct ovn_datapath *od,
+                                  struct lflow_input *input_data,
+                                  struct lflow_table *lflows)
+{
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+
+    build_ip_routing_pre_flows_for_lrouter(od, lflows,
+                                           od->route_lflow_ref);
+    build_static_route_flows_for_lrouter(od, input_data->features,
+                                         lflows,
+                                         input_data->lr_ports,
+                                         input_data->bfd_connections,
+                                         od->route_lflow_ref);
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+/* Public wrapper to rebuild only policy-specific flows for a single router. */
+void
+build_lr_policy_flows_for_datapath(struct ovn_datapath *od,
+                                   struct lflow_input *input_data,
+                                   struct lflow_table *lflows)
+{
+    build_ingress_policy_flows_for_lrouter(od, lflows,
+                                           input_data->lr_ports,
+                                           input_data->bfd_connections,
+                                           od->policy_lflow_ref);
 }
 
 /* Helper function to combine all lflow generation which is iterated by logical
@@ -17093,6 +17697,14 @@ lflow_reset_northd_refs(struct lflow_input *lflow_input)
     HMAP_FOR_EACH (lb_dps, hmap_node, lflow_input->lb_datapaths_map) {
         lflow_ref_clear(lb_dps->lflow_ref);
     }
+
+    /* Clear per-datapath lflow refs for router datapaths. */
+    struct ovn_datapath *od;
+    HMAP_FOR_EACH (od, key_node, &lflow_input->lr_datapaths->datapaths) {
+        lflow_ref_clear(od->lflow_ref);
+        lflow_ref_clear(od->route_lflow_ref);
+        lflow_ref_clear(od->policy_lflow_ref);
+    }
 }
 
 bool
@@ -17242,6 +17854,95 @@ lflow_handle_northd_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
             }
             sbrec_multicast_group_update_ports_addvalue(sbmc_unknown,
                                                         op->sb);
+        }
+    }
+
+    return true;
+}
+
+bool
+lflow_handle_northd_lr_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
+                                     struct tracked_lr_ports *trk_lrps,
+                                     struct lflow_input *lflow_input,
+                                     struct lflow_table *lflows)
+{
+    struct hmapx_node *hmapx_node;
+    struct ovn_port *op;
+
+    /* Deleted LRPs: sync flow deletions to SB. */
+    HMAPX_FOR_EACH (hmapx_node, &trk_lrps->deleted) {
+        op = hmapx_node->data;
+        ovs_assert(op->nbrp);
+
+        if (!lflow_ref_resync_flows(
+                op->lflow_ref, lflows, ovnsb_txn,
+                lflow_input->ls_datapaths,
+                lflow_input->lr_datapaths,
+                lflow_input->ovn_internal_version_changed,
+                lflow_input->sbrec_logical_flow_table,
+                lflow_input->sbrec_logical_dp_group_table)) {
+            return false;
+        }
+        if (!lflow_ref_resync_flows(
+                op->stateful_lflow_ref, lflows, ovnsb_txn,
+                lflow_input->ls_datapaths,
+                lflow_input->lr_datapaths,
+                lflow_input->ovn_internal_version_changed,
+                lflow_input->sbrec_logical_flow_table,
+                lflow_input->sbrec_logical_dp_group_table)) {
+            return false;
+        }
+    }
+
+    /* Created LRPs: generate and sync new flows. */
+    HMAPX_FOR_EACH (hmapx_node, &trk_lrps->created) {
+        op = hmapx_node->data;
+        ovs_assert(op->nbrp);
+
+        /* Only fields used by build_lswitch_and_lrouter_iterate_by_lrp
+         * and build_lbnat_lflows_iterate_by_lrp are initialized.
+         * Fields like features, igmp_groups, svc_monitor_map, etc.
+         * are zero (NULL) and not accessed by the per-LRP builders. */
+        struct lswitch_flow_build_info lsi = {
+            .ls_datapaths = lflow_input->ls_datapaths,
+            .lr_datapaths = lflow_input->lr_datapaths,
+            .ls_ports = lflow_input->ls_ports,
+            .lr_ports = lflow_input->lr_ports,
+            .lr_stateful_table = lflow_input->lr_stateful_table,
+            .lflows = lflows,
+            .meter_groups = lflow_input->meter_groups,
+            .match = DS_EMPTY_INITIALIZER,
+            .actions = DS_EMPTY_INITIALIZER,
+        };
+
+        build_lswitch_and_lrouter_iterate_by_lrp(op, &lsi);
+        build_lbnat_lflows_iterate_by_lrp(op,
+                                           lflow_input->lr_stateful_table,
+                                           lflow_input->meter_groups,
+                                           &lsi.match, &lsi.actions, lflows);
+
+        ds_destroy(&lsi.match);
+        ds_destroy(&lsi.actions);
+
+        /* Sync new flows to SB. */
+        bool handled = lflow_ref_sync_lflows(
+            op->lflow_ref, lflows, ovnsb_txn,
+            lflow_input->ls_datapaths,
+            lflow_input->lr_datapaths,
+            lflow_input->ovn_internal_version_changed,
+            lflow_input->sbrec_logical_flow_table,
+            lflow_input->sbrec_logical_dp_group_table);
+        if (handled) {
+            handled = lflow_ref_sync_lflows(
+                op->stateful_lflow_ref, lflows, ovnsb_txn,
+                lflow_input->ls_datapaths,
+                lflow_input->lr_datapaths,
+                lflow_input->ovn_internal_version_changed,
+                lflow_input->sbrec_logical_flow_table,
+                lflow_input->sbrec_logical_dp_group_table);
+        }
+        if (!handled) {
+            return false;
         }
     }
 

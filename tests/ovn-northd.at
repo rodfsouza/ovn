@@ -12254,12 +12254,9 @@ check ovn-nbctl --wait=sb lsp-add sw0 sw0p1 -- lsp-set-addresses sw0p1 "00:00:20
 
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-add lr0
-check_engine_stats northd recompute nocompute
-check_engine_stats lr_nat recompute nocompute
-check_engine_stats lr_stateful recompute nocompute
-check_engine_stats sync_to_sb_pb recompute nocompute
-check_engine_stats sync_to_sb_lb recompute nocompute
-check_engine_stats lflow recompute nocompute
+# Standalone router creation is handled incrementally by northd and lflow.
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 # Adding a logical router port should result in recompute
@@ -13622,6 +13619,349 @@ AT_CHECK([grep 'lr_in_ip_routing_ecmp' lr0flows | sed -E 's/== [[1-9]]+\)/== \?)
 ])
 
 check grep -q 'The ECMP route "192.168.10.0/24" contains "discard" route, the whole group will drop traffic' northd/ovn-northd.log
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+dnl -- Incremental router creation/deletion tests --
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- incremental processing for standalone LR creation])
+AT_KEYWORDS([incremental lr-create])
+
+ovn_start
+
+# Create initial topology to warm up engine
+check ovn-nbctl --wait=sb lr-add lr0
+check ovn-nbctl --wait=sb ls-add ls0
+check ovn-nbctl --wait=sb \
+    lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+check ovn-nbctl --wait=sb \
+    lsp-add ls0 lsp0_rp -- lsp-set-type lsp0_rp router \
+    -- lsp-set-addresses lsp0_rp router \
+    -- lsp-set-options lsp0_rp router-port=rp0
+
+# ---- Test: Add a standalone router (no ports, no NATs) ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+
+check ovn-nbctl --wait=sb lr-add lr1
+
+# Northd and lflow handle standalone router creation incrementally.
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
+
+# Verify SB state: new datapath binding exists
+check_row_count Datapath_Binding 3
+
+# Verify full recompute produces identical SB state
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- LR deletion falls back to recompute])
+AT_KEYWORDS([incremental lr-delete])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+check ovn-nbctl --wait=sb lr-add lr1
+
+check_row_count Datapath_Binding 2
+
+# ---- Test: Delete lr1 ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-del lr1
+
+# Standalone router deletion handled incrementally by northd.
+# Lflow still recomputes for datapath group cleanup.
+check_engine_stats northd norecompute compute
+check_engine_stats lflow recompute nocompute
+check_row_count Datapath_Binding 1
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- LR creation with ports falls back to recompute])
+AT_KEYWORDS([incremental lr-create-ports])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+
+# ---- Test: Add router + port in single transaction ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+
+check ovn-nbctl --wait=sb \
+    lr-add lr1 \
+    -- lrp-add lr1 rp1 00:00:00:00:00:02 10.1.0.1/24
+
+# Router with ports in same txn — handled incrementally by northd (C.6)
+check_engine_stats northd norecompute compute
+
+check_row_count Datapath_Binding 2
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- LR created then ports added separately])
+AT_KEYWORDS([incremental lr-then-ports])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+
+# ---- Step 1: Create standalone router (incremental) ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-add lr1
+
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 2
+
+# ---- Step 2: Add port to existing router (incremental via LRP handler
+# with per-LRP lflow tracking) ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb \
+    lrp-add lr1 rp1 00:00:00:00:00:02 10.1.0.1/24
+
+check_engine_stats northd norecompute compute
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- multiple standalone LR add/delete operations])
+AT_KEYWORDS([incremental lr-multi])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+
+# ---- Add lr1 (incremental) ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-add lr1
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 2
+
+# ---- Add lr2 (incremental) ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-add lr2
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 3
+
+# ---- Delete lr1 (northd incremental, lflow recomputes) ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-del lr1
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 2
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- LR with NAT in same txn falls back to recompute])
+AT_KEYWORDS([incremental lr-create-nat])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0 \
+    -- lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+# ---- Test: Create router + NAT in single transaction ----
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+
+check ovn-nbctl --wait=sb lr-add lr1 \
+    -- lrp-add lr1 rp1 00:00:00:00:00:02 10.1.0.1/24 \
+    -- lr-nat-add lr1 dnat_and_snat 172.16.1.1 10.1.0.11
+
+# Router with NAT + port — handled incrementally by northd (C.6)
+check_engine_stats northd norecompute compute
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- LR static routes and policies trigger recompute])
+AT_KEYWORDS([incremental lr-fallback])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+check ovn-nbctl --wait=sb \
+    lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+# Static routes on existing router — handled incrementally
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-route-add lr0 192.168.0.0/16 10.0.0.254
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
+
+# Policies on existing router — handled incrementally
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-policy-add lr0 100 "ip4.src == 10.0.0.0/24" allow
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- incremental LRP add on existing router])
+AT_KEYWORDS([incremental lrp-add])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+# LRP handler creates port + SB binding incrementally, with
+# per-LRP lflow tracking via op->lflow_ref and op->stateful_lflow_ref.
+check_engine_stats northd norecompute compute
+wait_row_count Port_Binding 1 logical_port=rp0
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- incremental LRP delete on existing router])
+AT_KEYWORDS([incremental lrp-del])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0
+check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lrp-del rp0
+
+# LRP handler deletes port + SB binding incrementally, with
+# per-LRP lflow tracking via lflow_ref_resync_flows().
+check_engine_stats northd norecompute compute
+check_row_count Port_Binding 0
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- incremental deletion of router with ports])
+AT_KEYWORDS([incremental lr-del-ports])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lr-add lr0 \
+    -- lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+check_row_count Datapath_Binding 1
+wait_row_count Port_Binding 1 logical_port=rp0
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-del lr0
+
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 0
+check_row_count Port_Binding 0
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- router creation with load balancer])
+AT_KEYWORDS([incremental lr-create-lb])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lb-add lb1 10.0.0.100:80 10.0.0.1:80
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-add lr1 -- lr-lb-add lr1 lb1
+
+# Router with LB handled incrementally (bitmap resized lazily
+# in ovn_lb_datapaths_add_lr).
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 1
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- router creation with multiple load balancers])
+AT_KEYWORDS([incremental lr-multi-lb])
+
+ovn_start
+
+check ovn-nbctl --wait=sb lb-add lb1 10.0.0.100:80 10.0.0.1:80
+check ovn-nbctl --wait=sb lb-add lb2 10.0.0.200:443 10.0.0.2:443
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-add lr1 \
+    -- lr-lb-add lr1 lb1 \
+    -- lr-lb-add lr1 lb2
+
+# Router with multiple LBs handled incrementally (bitmap resized lazily).
+check_engine_stats northd norecompute compute
+check_row_count Datapath_Binding 1
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- incremental LRP add without peer LSP])
+AT_KEYWORDS([incremental lrp-no-peer])
+
+ovn_start
+
+# Create router without any connected switch.
+check ovn-nbctl --wait=sb lr-add lr0
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
+
+# LRP created incrementally even without peer LSP.
+# Flows are generated without peer, matching full recompute behavior.
+check_engine_stats northd norecompute compute
+wait_row_count Port_Binding 1 logical_port=rp0
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 OVN_CLEANUP_NORTHD
 AT_CLEANUP

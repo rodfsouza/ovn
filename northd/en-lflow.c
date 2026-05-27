@@ -128,16 +128,119 @@ lflow_northd_handler(struct engine_node *node,
         return false;
     }
 
+    /* Router deletion: lflow_refs were already cleared in the northd
+     * handler. Any flows that were only referenced by the deleted
+     * datapath will be garbage collected during the next full lflow
+     * sync. For now, trigger lflow recompute to ensure proper cleanup
+     * of datapath group memberships in shared flows. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
+        return false;
+    }
+
     const struct engine_context *eng_ctx = engine_get_context();
     struct lflow_data *lflow_data = data;
 
     struct lflow_input lflow_input;
     lflow_get_input_data(node, &lflow_input);
 
+    /* Handle new router datapaths — generate base flows incrementally
+     * using per-datapath lflow_ref, then sync to SB. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node, &northd_data->trk_data.trk_created_lrs) {
+            struct ovn_datapath *od = hmapx_node->data;
+
+            build_lr_flows_for_datapath(od, &lflow_input,
+                                        lflow_data->lflow_table);
+
+            if (!lflow_ref_sync_lflows(
+                    od->lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)
+                || !lflow_ref_sync_lflows(
+                    od->route_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)
+                || !lflow_ref_sync_lflows(
+                    od->policy_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
+            }
+        }
+    }
+
+    /* Handle routers whose static routes changed — rebuild only route flows
+     * using the per-datapath route_lflow_ref. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.lr_with_changed_routes) {
+            struct ovn_datapath *od = hmapx_node->data;
+
+            lflow_ref_unlink_lflows(od->route_lflow_ref);
+            build_lr_route_flows_for_datapath(od, &lflow_input,
+                                              lflow_data->lflow_table);
+            if (!lflow_ref_sync_lflows(
+                    od->route_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
+            }
+        }
+    }
+
+    /* Handle routers whose policies changed — rebuild only policy flows. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_POLICIES) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.lr_with_changed_policies) {
+            struct ovn_datapath *od = hmapx_node->data;
+
+            lflow_ref_unlink_lflows(od->policy_lflow_ref);
+            build_lr_policy_flows_for_datapath(od, &lflow_input,
+                                               lflow_data->lflow_table);
+            if (!lflow_ref_sync_lflows(
+                    od->policy_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
+            }
+        }
+    }
+
     if (!lflow_handle_northd_port_changes(eng_ctx->ovnsb_idl_txn,
                                           &northd_data->trk_data.trk_lsps,
                                           &lflow_input,
                                           lflow_data->lflow_table)) {
+        return false;
+    }
+
+    if (!lflow_handle_northd_lr_port_changes(
+            eng_ctx->ovnsb_idl_txn,
+            &northd_data->trk_data.trk_lrps,
+            &lflow_input,
+            lflow_data->lflow_table)) {
         return false;
     }
 

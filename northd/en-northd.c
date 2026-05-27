@@ -180,16 +180,43 @@ bool
 northd_nb_logical_router_handler(struct engine_node *node,
                                  void *data)
 {
+    const struct engine_context *eng_ctx = engine_get_context();
     struct northd_data *nd = data;
     struct northd_input input_data;
 
     northd_get_input_data(node, &input_data);
 
-    if (!northd_handle_lr_changes(&input_data, nd)) {
+    if (!northd_handle_lr_changes(eng_ctx->ovnsb_idl_txn,
+                                  &input_data, nd)) {
         return false;
     }
 
-    if (northd_has_lr_nats_in_tracked_data(&nd->trk_data)) {
+    if (northd_has_tracked_data(&nd->trk_data)) {
+        engine_set_node_state(node, EN_UPDATED);
+    }
+
+    return true;
+}
+
+bool
+northd_nb_logical_router_port_handler(struct engine_node *node,
+                                      void *data)
+{
+    const struct engine_context *eng_ctx = engine_get_context();
+    struct northd_data *nd = data;
+    struct northd_input input_data;
+
+    northd_get_input_data(node, &input_data);
+
+    const struct nbrec_logical_router_port_table *lrp_table =
+        EN_OVSDB_GET(engine_get_input("nb_logical_router_port", node));
+
+    if (!northd_handle_lrp_changes(eng_ctx->ovnsb_idl_txn,
+                                   lrp_table, &input_data, nd)) {
+        return false;
+    }
+
+    if (northd_has_tracked_data(&nd->trk_data)) {
         engine_set_node_state(node, EN_UPDATED);
     }
 
