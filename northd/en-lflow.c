@@ -128,6 +128,15 @@ lflow_northd_handler(struct engine_node *node,
         return false;
     }
 
+    /* New/deleted router datapaths require full lflow recompute because
+     * per-datapath lflow_ref is not yet implemented.  The northd handler
+     * materializes the datapath and SB bindings; lflow regenerates all
+     * flows including for the new router. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED
+        || northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
+        return false;
+    }
+
     const struct engine_context *eng_ctx = engine_get_context();
     struct lflow_data *lflow_data = data;
 

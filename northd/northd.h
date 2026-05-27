@@ -145,8 +145,9 @@ struct northd_tracked_data {
      * hmapx node is 'struct ovn_datapath *'. */
     struct hmapx ls_with_changed_acls;
 
-    /* Tracked created logical routers.
-     * hmapx node is 'struct ovn_datapath *'. */
+    /* Tracked created logical routers (standalone, no ports/NATs).
+     * hmapx node data is 'struct ovn_datapath *' — fully materialized
+     * with SB datapath_binding and tunnel key assigned. */
     struct hmapx trk_created_lrs;
 
     /* Tracked deleted logical routers.
@@ -679,7 +680,8 @@ void ovnsb_db_run(struct ovsdb_idl_txn *ovnnb_txn,
 bool northd_handle_ls_changes(struct ovsdb_idl_txn *,
                               const struct northd_input *,
                               struct northd_data *);
-bool northd_handle_lr_changes(const struct northd_input *,
+bool northd_handle_lr_changes(struct ovsdb_idl_txn *,
+                              const struct northd_input *,
                               struct northd_data *);
 bool northd_handle_lrp_changes(const struct northd_input *,
                                struct northd_data *);

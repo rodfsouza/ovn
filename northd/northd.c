@@ -4960,19 +4960,106 @@ is_lr_nats_changed(const struct nbrec_logical_router *nbr) {
  * handler -  northd_handle_lb_data_changes().
  * */
 bool
-northd_handle_lr_changes(const struct northd_input *ni,
+northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                         const struct northd_input *ni,
                          struct northd_data *nd)
 {
     const struct nbrec_logical_router *changed_lr;
 
     NBREC_LOGICAL_ROUTER_TABLE_FOR_EACH_TRACKED (changed_lr,
                                              ni->nbrec_logical_router_table) {
-        if (nbrec_logical_router_is_new(changed_lr) ||
-            nbrec_logical_router_is_deleted(changed_lr)) {
-            /* Router creation/deletion requires datapath materialization
-             * and cleanup that is not yet implemented incrementally.
-             * Phase C.2+ will add actual datapath create/destroy here.
-             * For now, fall back to full recompute. */
+        if (nbrec_logical_router_is_new(changed_lr)) {
+            /* Incremental handling of standalone router creation.
+             * Fall back for routers with ports, NATs, LBs, policies,
+             * or static routes in the same transaction. */
+            if (changed_lr->n_ports > 0
+                || changed_lr->n_nat > 0
+                || changed_lr->n_load_balancer > 0
+                || changed_lr->n_policies > 0
+                || changed_lr->n_static_routes > 0
+                || !lrouter_is_enabled(changed_lr)) {
+                goto fail;
+            }
+
+            /* Verify not already in lr_datapaths. */
+            if (ovn_datapath_find_(&nd->lr_datapaths.datapaths,
+                                   &changed_lr->header_.uuid)) {
+                goto fail;
+            }
+
+            /* Create the datapath. */
+            struct ovn_datapath *od = ovn_datapath_create(
+                &nd->lr_datapaths.datapaths, &changed_lr->header_.uuid,
+                NULL, changed_lr, NULL);
+
+            /* Initialize multicast info. */
+            init_mcast_info_for_datapath(od);
+            if (smap_get(&od->nbr->options, "chassis")) {
+                od->is_gw_router = true;
+            }
+
+            /* Allocate tunnel key by scanning existing datapaths.
+             * Build a temporary set of used tunnel IDs. */
+            struct hmap dp_tnlids = HMAP_INITIALIZER(&dp_tnlids);
+            struct ovn_datapath *iter;
+            HMAP_FOR_EACH (iter, key_node,
+                           &nd->lr_datapaths.datapaths) {
+                if (iter != od && iter->tunnel_key) {
+                    ovn_add_tnlid(&dp_tnlids, iter->tunnel_key);
+                }
+            }
+            HMAP_FOR_EACH (iter, key_node,
+                           &nd->ls_datapaths.datapaths) {
+                if (iter->tunnel_key) {
+                    ovn_add_tnlid(&dp_tnlids, iter->tunnel_key);
+                }
+            }
+
+            /* Try requested tunnel key first. */
+            ovn_datapath_assign_requested_tnl_id(
+                ni->sbrec_chassis_table, &dp_tnlids, od);
+
+            if (!od->tunnel_key) {
+                /* No requested key; allocate a free one. */
+                uint32_t max_key = get_ovn_max_dp_key_local(
+                    ni->sbrec_chassis_table);
+                uint32_t hint = 0;
+                od->tunnel_key = ovn_allocate_tnlid(
+                    &dp_tnlids, "datapath",
+                    OVN_MIN_DP_KEY_LOCAL, max_key, &hint);
+            }
+            ovn_destroy_tnlids(&dp_tnlids);
+
+            if (!od->tunnel_key) {
+                static struct vlog_rate_limit rl =
+                    VLOG_RATE_LIMIT_INIT(1, 1);
+                VLOG_WARN_RL(&rl, "No available tunnel key for new "
+                             "router %s", changed_lr->name);
+                ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
+                goto fail;
+            }
+
+            /* Insert SB datapath_binding record. */
+            od->sb = sbrec_datapath_binding_insert(ovnsb_idl_txn);
+            ovn_datapath_update_external_ids(od);
+            sbrec_datapath_binding_set_tunnel_key(od->sb,
+                                                  od->tunnel_key);
+
+            /* Add to lr_list. */
+            ovs_list_push_back(&nd->lr_list, &od->lr_list);
+
+            /* Rebuild array index (new datapath added). */
+            ods_build_array_index(&nd->lr_datapaths);
+
+            /* Track for downstream handlers. */
+            hmapx_add(&nd->trk_data.trk_created_lrs, od);
+            continue;
+        }
+
+        if (nbrec_logical_router_is_deleted(changed_lr)) {
+            /* Router deletion — fall back to recompute for now.
+             * Incremental deletion requires cleaning up flows, port
+             * bindings, multicast groups, and lr_group references. */
             goto fail;
         }
 
@@ -5003,9 +5090,9 @@ northd_handle_lr_changes(const struct northd_input *ni,
         nd->trk_data.type |= NORTHD_TRACKED_LR_NATS;
     }
 
-    /* NORTHD_TRACKED_LR_CREATED and NORTHD_TRACKED_LR_DELETED are
-     * defined but not yet set here — Phase C.2+ will add actual
-     * datapath materialization before setting these flags. */
+    if (!hmapx_is_empty(&nd->trk_data.trk_created_lrs)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_CREATED;
+    }
 
     return true;
 fail:

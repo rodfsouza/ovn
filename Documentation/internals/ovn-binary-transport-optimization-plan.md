@@ -1,5 +1,35 @@
 # Plan: Optimize Northd Incremental Flow Processing with Binary Transport
 
+## Implementation Status (2026-05-26)
+
+| Phase | Status | Commit | Notes |
+|-------|--------|--------|-------|
+| **A** | **DONE** | OVS `aed87a9f7` | Direct binary→datum path. Eliminates JSON round-trip for ROW_BATCH. |
+| **B** | **DONE** | OVN `a4cd3936a` | Perf test in `tests/perf-northd.at`. |
+| **C.1** | **DONE** | OVN (uncommitted) | Actual datapath materialization for standalone routers. `northd norecompute compute`. |
+| **C.2** | **DONE** | OVN (uncommitted) | 4 new engine nodes (LRP, static_route, policy, NAT). |
+| **C.3** | **DONE** | OVN (uncommitted) | LRP handler (returns false — safe recompute fallback). |
+| **C.4** | NOT STARTED | — | Per-LRP incremental flow generation with `lflow_ref`. Requires per-datapath `lflow_ref`. |
+| **C.5** | NOT STARTED | — | Incremental static route handling. |
+| **C.6** | NOT STARTED | — | Router + ports in single transaction (Tier 2). |
+| **C.7** | NOT STARTED | — | Incremental policy handling. |
+| **D** | NOT STARTED | — | Binary UPDATE_BATCH with direct datum path. XOR support needed. |
+| **E** | NOT STARTED | — | Streaming-aware batch processing. |
+
+### Key Remaining Work for Full Incremental Path
+
+1. **Per-datapath `lflow_ref`**: Add `struct lflow_ref *lflow_ref` to `struct ovn_datapath`. This enables lflow handler to generate only the new router's flows instead of full recompute. Changes `lflow` column from "recompute" to "norecompute compute".
+
+2. **`lr_group` creation**: `build_lrouter_groups()` is not called incrementally. New standalone router needs a single-member `lr_group`. Must be created in `northd_handle_lr_changes()` after datapath materialization.
+
+3. **Router deletion**: Requires cleaning up flows (via `lflow_ref`), SB `datapath_binding`, `lr_group` membership, and `lr_datapaths` hmap/array. Complex due to cross-datapath references.
+
+4. **Per-LRP handling**: `northd_handle_lrp_changes()` currently returns false. Full implementation needs: port lookup via `lr_ports`, parent via `op->od`, per-LRP flow generation via `build_lswitch_and_lrouter_iterate_by_lrp()`, and `lflow_ref_sync_lflows()`.
+
+5. **Binary XOR support**: `ovsdb_idl_binary_row_change()` has `OVS_NOT_REACHED()` for XOR mode. Phase D needs `ovsdb_datum_apply_diff_in_place()` support.
+
+---
+
 ## Context
 
 With binary transport enabled for OVN daemons (commit 4a57bf8b1), we identified two critical performance problems in production OVN deployments with 10,000+ chassis and SB databases exceeding 1 GB:
