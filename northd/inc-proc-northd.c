@@ -218,15 +218,17 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_northd, &en_nb_logical_router,
                      northd_nb_logical_router_handler);
 
-    /* Router sub-table inputs.  NULL handlers mean any change to these
-     * tables triggers a full northd recompute.  Future work will add
-     * incremental handlers that use lr_ports hmap lookup (op->od) to
-     * map sub-object changes back to their parent router. */
+    /* Router sub-table inputs.  Changes to these sub-tables also update
+     * the parent Logical_Router row's column (ports, static_routes,
+     * policies, nat), which is handled by northd_nb_logical_router_handler.
+     * Use noop_handler here to avoid redundant recompute. */
     engine_add_input(&en_northd, &en_nb_logical_router_port,
                      northd_nb_logical_router_port_handler);
-    engine_add_input(&en_northd, &en_nb_logical_router_static_route, NULL);
-    engine_add_input(&en_northd, &en_nb_logical_router_policy, NULL);
-    engine_add_input(&en_northd, &en_nb_nat, NULL);
+    engine_add_input(&en_northd, &en_nb_logical_router_static_route,
+                     engine_noop_handler);
+    engine_add_input(&en_northd, &en_nb_logical_router_policy,
+                     engine_noop_handler);
+    engine_add_input(&en_northd, &en_nb_nat, engine_noop_handler);
 
     engine_add_input(&en_northd, &en_lb_data, northd_lb_data_handler);
 
