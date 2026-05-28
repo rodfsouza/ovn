@@ -188,7 +188,8 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_northd, &en_sb_chassis, NULL);
     engine_add_input(&en_northd, &en_sb_mirror, NULL);
     engine_add_input(&en_northd, &en_sb_meter, NULL);
-    engine_add_input(&en_northd, &en_sb_datapath_binding, NULL);
+    engine_add_input(&en_northd, &en_sb_datapath_binding,
+                     northd_sb_datapath_binding_handler);
     engine_add_input(&en_northd, &en_sb_dns, NULL);
     engine_add_input(&en_northd, &en_sb_ha_chassis_group, NULL);
     engine_add_input(&en_northd, &en_sb_ip_multicast, NULL);
