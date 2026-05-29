@@ -5541,37 +5541,32 @@ northd_handle_sb_datapath_binding_changes(
             continue;
         }
 
-        if (sbrec_datapath_binding_is_new(dp)) {
-            /* Most likely we just inserted this.  Find the matching
-             * ovn_datapath and update its sb pointer. */
-            struct ovn_datapath *od = ovn_datapath_find_(
-                &lr_datapaths->datapaths, &dp->header_.uuid);
-            if (!od) {
-                od = ovn_datapath_find_(
-                    &ls_datapaths->datapaths, &dp->header_.uuid);
-            }
-            if (!od) {
-                return false;
-            }
-            od->sb = dp;
-            continue;
-        }
-
         if (sbrec_datapath_binding_is_deleted(dp)) {
             return false;
         }
 
-        /* Modified — if the datapath is known, this is our own
-         * update (external_ids, tunnel_key).  No action needed. */
+        /* Look up matching ovn_datapath via the NB UUID in external_ids.
+         * The SB row UUID differs from the NB UUID used as hmap key. */
+        struct uuid nb_uuid;
+        const char *uuid_s = smap_get(&dp->external_ids, "logical-router");
+        if (!uuid_s) {
+            uuid_s = smap_get(&dp->external_ids, "logical-switch");
+        }
+        if (!uuid_s || !uuid_from_string(&nb_uuid, uuid_s)) {
+            return false;
+        }
+
         struct ovn_datapath *od = ovn_datapath_find_(
-            &lr_datapaths->datapaths, &dp->header_.uuid);
+            &lr_datapaths->datapaths, &nb_uuid);
         if (!od) {
             od = ovn_datapath_find_(
-                &ls_datapaths->datapaths, &dp->header_.uuid);
+                &ls_datapaths->datapaths, &nb_uuid);
         }
         if (!od) {
             return false;
         }
+
+        od->sb = dp;
     }
 
     return true;
