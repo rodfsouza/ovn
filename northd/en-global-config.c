@@ -197,7 +197,12 @@ global_config_nb_global_handler(struct engine_node *node, void *data)
         return false;
     }
 
-    /* We are only interested in ipsec and options column. */
+    struct ed_type_global_config *config_data = data;
+    config_data->tracked = true;
+
+    /* We are only interested in ipsec and options column.
+     * Other columns (sb_cfg, nb_cfg_timestamp, etc.) are updated by
+     * update_sequence_numbers() every cycle — ignore them. */
     if (!nbrec_nb_global_is_updated(nb, NBREC_NB_GLOBAL_COL_IPSEC)
         && !nbrec_nb_global_is_updated(nb, NBREC_NB_GLOBAL_COL_OPTIONS)) {
         return true;
@@ -206,9 +211,6 @@ global_config_nb_global_handler(struct engine_node *node, void *data)
     if (nb->ipsec != sb->ipsec) {
         sbrec_sb_global_set_ipsec(sb, nb->ipsec);
     }
-
-    struct ed_type_global_config *config_data = data;
-    config_data->tracked = true;
 
     if (smap_equal(&nb->options, &config_data->nb_options)) {
         return true;
