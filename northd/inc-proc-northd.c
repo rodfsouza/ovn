@@ -263,10 +263,18 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_lflow, &en_nb_acl, NULL);
     engine_add_input(&en_lflow, &en_sync_meters, NULL);
     engine_add_input(&en_lflow, &en_sb_bfd, NULL);
-    engine_add_input(&en_lflow, &en_sb_logical_flow, NULL);
-    engine_add_input(&en_lflow, &en_sb_multicast_group, NULL);
+    /* Logical_Flow, Multicast_Group, and Logical_DP_Group are written
+     * exclusively by northd/lflow.  SB feedback from our own writes
+     * must not trigger lflow recompute — use noop_handler.
+     * IGMP_Group is written by ovn-controller, so keep NULL (recompute
+     * on external IGMP changes is correct). */
+    engine_add_input(&en_lflow, &en_sb_logical_flow,
+                     engine_noop_handler);
+    engine_add_input(&en_lflow, &en_sb_multicast_group,
+                     engine_noop_handler);
     engine_add_input(&en_lflow, &en_sb_igmp_group, NULL);
-    engine_add_input(&en_lflow, &en_sb_logical_dp_group, NULL);
+    engine_add_input(&en_lflow, &en_sb_logical_dp_group,
+                     engine_noop_handler);
     engine_add_input(&en_lflow, &en_global_config,
                      node_global_config_handler);
     engine_add_input(&en_lflow, &en_northd, lflow_northd_handler);
