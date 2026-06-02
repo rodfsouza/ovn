@@ -120,27 +120,49 @@ lr_nat_northd_handler(struct engine_node *node, void *data_)
         return false;
     }
 
-    if (!northd_has_lr_nats_in_tracked_data(&northd_data->trk_data)) {
-        return true;
+    /* Router deletion: fall back to recompute to rebuild array. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
+        return false;
     }
 
     struct ed_type_lr_nat_data *data = data_;
-    struct lr_nat_record *lrnat_rec;
-    const struct ovn_datapath *od;
-    struct hmapx_node *hmapx_node;
 
-    HMAPX_FOR_EACH (hmapx_node, &northd_data->trk_data.trk_nat_lrs) {
-        od = hmapx_node->data;
-        lrnat_rec = lr_nat_table_find_by_index_(&data->lr_nats, od->index);
-        ovs_assert(lrnat_rec);
-        lr_nat_record_reinit(lrnat_rec, od);
+    /* Router creation: resize array and create lr_nat records. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED) {
+        data->lr_nats.array = xrealloc(
+            data->lr_nats.array,
+            ods_size(&northd_data->lr_datapaths)
+                * sizeof *data->lr_nats.array);
 
-        /* Add the lrnet rec to the tracking data. */
-        hmapx_add(&data->trk_data.crupdated, lrnat_rec);
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.trk_created_lrs) {
+            const struct ovn_datapath *od = hmapx_node->data;
+            lr_nat_record_create(&data->lr_nats, od);
+        }
+        engine_set_node_state(node, EN_UPDATED);
     }
 
-    if (lr_nat_has_tracked_data(&data->trk_data)) {
-        engine_set_node_state(node, EN_UPDATED);
+    /* NAT changes on existing routers. */
+    if (northd_has_lr_nats_in_tracked_data(&northd_data->trk_data)) {
+        struct lr_nat_record *lrnat_rec;
+        const struct ovn_datapath *od;
+        struct hmapx_node *hmapx_node;
+
+        HMAPX_FOR_EACH (hmapx_node, &northd_data->trk_data.trk_nat_lrs) {
+            od = hmapx_node->data;
+            lrnat_rec = lr_nat_table_find_by_index_(
+                &data->lr_nats, od->index);
+            ovs_assert(lrnat_rec);
+            lr_nat_record_reinit(lrnat_rec, od);
+
+            /* Add the lrnat rec to the tracking data. */
+            hmapx_add(&data->trk_data.crupdated, lrnat_rec);
+        }
+
+        if (lr_nat_has_tracked_data(&data->trk_data)) {
+            engine_set_node_state(node, EN_UPDATED);
+        }
     }
 
     return true;

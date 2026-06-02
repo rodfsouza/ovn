@@ -997,6 +997,21 @@ ods_build_array_index(struct ovn_datapaths *datapaths)
     }
 }
 
+/* Append a new datapath to the array without reassigning existing indices.
+ * The new datapath gets index = current_count - 1 (it's already in the hmap).
+ * Preserves all index-based lookups in downstream tables (lr_nat_table,
+ * lr_stateful_table, lb_datapaths bitmaps). */
+static void
+ods_append_datapath(struct ovn_datapaths *datapaths, struct ovn_datapath *od)
+{
+    size_t n = ods_size(datapaths);
+    datapaths->array = xrealloc(datapaths->array,
+                                n * sizeof *datapaths->array);
+    od->index = n - 1;
+    datapaths->array[od->index] = od;
+    od->datapaths = datapaths;
+}
+
 /* Updates the southbound Datapath_Binding table so that it contains the
  * logical switches and routers specified by the northbound database.
  *
@@ -5103,8 +5118,11 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             /* Add to lr_list. */
             ovs_list_push_back(&nd->lr_list, &od->lr_list);
 
-            /* Rebuild array index (new datapath added). */
-            ods_build_array_index(&nd->lr_datapaths);
+            /* Append new datapath at end of array without reassigning
+             * existing indices.  ods_build_array_index() would reshuffle
+             * ALL indices, invalidating downstream index-based lookups
+             * in lr_nat_table and lr_stateful_table. */
+            ods_append_datapath(&nd->lr_datapaths, od);
 
             /* Resize ALL existing LB bitmaps to the new datapath count.
              * Required because BITMAP_FOR_EACH_1 callers (in lflow
@@ -5287,11 +5305,14 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             /* Remove from lr_list. */
             ovs_list_remove(&od->lr_list);
 
+            /* Null out array slot before destroying.  Don't call
+             * ods_build_array_index() which would reshuffle indices.
+             * The lr_nat/lr_stateful handlers return false for
+             * NORTHD_TRACKED_LR_DELETED, forcing their full rebuild. */
+            nd->lr_datapaths.array[od->index] = NULL;
+
             /* Destroy the datapath (removes from lr_datapaths hmap). */
             ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
-
-            /* Rebuild array index. */
-            ods_build_array_index(&nd->lr_datapaths);
 
             /* Track deletion for downstream handlers. */
             nd->trk_data.type |= NORTHD_TRACKED_LR_DELETED;
