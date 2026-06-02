@@ -132,37 +132,49 @@ en_lr_stateful_run(struct engine_node *node, void *data_)
 }
 
 bool
-lr_stateful_northd_handler(struct engine_node *node, void *data OVS_UNUSED)
+lr_stateful_northd_handler(struct engine_node *node, void *data_)
 {
     struct northd_data *northd_data = engine_get_input_data("northd", node);
     if (!northd_has_tracked_data(&northd_data->trk_data)) {
         return false;
     }
 
-    /* This node uses the below data from the en_northd engine node.
-     * See (lr_stateful_get_input_data())
-     *   1. northd_data->lr_datapaths
-     *      This data gets updated when a logical router is created or deleted.
-     *      northd engine node presently falls back to full recompute when
-     *      this happens and so does this node.
-     *      Note: When we add I-P to the created/deleted logical routers, we
-     *      need to revisit this handler.
-     *
-     *      This node also accesses the router ports of the logical router
-     *      (od->ports).  When these logical router ports gets updated,
-     *      en_northd engine recomputes and so does this node.
-     *      Note: When we add I-P to handle router port changes, we need
-     *      to revisit this handler.
-     *
-     *   2. northd_data->lb_datapaths_map
-     *   3. northd_data->lb_group_datapaths_map
-     *
-     * (2) and (3) northd data gets updated when en_lb_data engine node gets
-     * updated and en_lb_data is also an input to this node and it provides
-     * the changes in its tracking data. So we can ignore changes in (2)
-     * and (3) if any.
-     *
-     * */
+    /* Router deletion: fall back to recompute to rebuild array. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
+        return false;
+    }
+
+    /* Router creation: resize array and create lr_stateful records.
+     * The lr_nat handler has already created lr_nat records for these
+     * routers (guaranteed by DAG evaluation order). */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED) {
+        struct ed_type_lr_stateful *data = data_;
+        struct lr_stateful_input input_data =
+            lr_stateful_get_input_data(node);
+
+        data->table.array = xrealloc(
+            data->table.array,
+            ods_size(input_data.lr_datapaths)
+                * sizeof *data->table.array);
+
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.trk_created_lrs) {
+            const struct ovn_datapath *od = hmapx_node->data;
+
+            const struct lr_nat_record *lrnat_rec =
+                lr_nat_table_find_by_index(input_data.lr_nats, od->index);
+            ovs_assert(lrnat_rec);
+
+            lr_stateful_record_create(&data->table, lrnat_rec, od,
+                                       input_data.lb_datapaths_map,
+                                       input_data.lbgrp_datapaths_map);
+        }
+        engine_set_node_state(node, EN_UPDATED);
+    }
+
+    /* LB/LB-group and NAT changes on existing routers are handled
+     * by lr_stateful_lb_data_handler and lr_stateful_lr_nat_handler. */
     return true;
 }
 
