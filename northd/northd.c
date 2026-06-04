@@ -5308,14 +5308,15 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             /* Remove from lr_list. */
             ovs_list_remove(&od->lr_list);
 
-            /* Null out array slot before destroying.  Don't call
-             * ods_build_array_index() which would reshuffle indices.
-             * The lr_nat/lr_stateful handlers return false for
-             * NORTHD_TRACKED_LR_DELETED, forcing their full rebuild. */
-            nd->lr_datapaths.array[od->index] = NULL;
-
             /* Destroy the datapath (removes from lr_datapaths hmap). */
             ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
+
+            /* Reassign all indices to close the gap left by the
+             * deleted datapath.  This is safe because
+             * NORTHD_TRACKED_LR_DELETED forces full recompute of all
+             * downstream nodes (lr_nat, lr_stateful, lflow), so no
+             * downstream table retains stale index references. */
+            ods_build_array_index(&nd->lr_datapaths);
 
             /* Track deletion for downstream handlers. */
             nd->trk_data.type |= NORTHD_TRACKED_LR_DELETED;
