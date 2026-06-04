@@ -92,7 +92,6 @@ static const char *unixctl_path;
 static const char *ssl_private_key_file;
 static const char *ssl_certificate_file;
 static const char *ssl_ca_cert_file;
-static bool use_binary_transport = true;
 
 
 static void
@@ -111,7 +110,6 @@ Options:\n\
                             (default: %s)\n\
   --ic-sb-db=DATABASE       connect to ovn-ic-sb database at DATABASE\n\
                             (default: %s)\n\
-  --no-binary-transport     disable binary format for OVSDB connections\n\
   --unixctl=SOCKET          override default control socket name\n\
   -h, --help                display this help message\n\
   -o, --options             list available options\n\
@@ -2033,7 +2031,6 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         OVN_DAEMON_OPTION_ENUMS,
         VLOG_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
-        OPT_NO_BINARY_TRANSPORT,
     };
     static const struct option long_options[] = {
         {"ovnsb-db", required_argument, NULL, 'd'},
@@ -2044,7 +2041,6 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         {"help", no_argument, NULL, 'h'},
         {"options", no_argument, NULL, 'o'},
         {"version", no_argument, NULL, 'V'},
-        {"no-binary-transport", no_argument, NULL, OPT_NO_BINARY_TRANSPORT},
         OVN_DAEMON_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
@@ -2115,10 +2111,6 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         case 'V':
             ovn_print_version(0, 0);
             exit(EXIT_SUCCESS);
-
-        case OPT_NO_BINARY_TRANSPORT:
-            use_binary_transport = false;
-            break;
 
         default:
             break;
@@ -2224,17 +2216,14 @@ main(int argc, char *argv[])
     /* ovn-ic-nb db. */
     struct ovsdb_idl_loop ovninb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovn_ic_nb_db, &icnbrec_idl_class, true, true));
-    ovsdb_idl_set_binary_transport(ovninb_idl_loop.idl, use_binary_transport);
 
     /* ovn-ic-sb db. */
     struct ovsdb_idl_loop ovnisb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovn_ic_sb_db, &icsbrec_idl_class, true, true));
-    ovsdb_idl_set_binary_transport(ovnisb_idl_loop.idl, use_binary_transport);
 
     /* ovn-nb db. */
     struct ovsdb_idl_loop ovnnb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnnb_db, &nbrec_idl_class, false, true));
-    ovsdb_idl_set_binary_transport(ovnnb_idl_loop.idl, use_binary_transport);
 
     ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_nb_global);
     ovsdb_idl_add_column(ovnnb_idl_loop.idl, &nbrec_nb_global_col_name);
@@ -2312,7 +2301,6 @@ main(int argc, char *argv[])
     /* ovn-sb db. */
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnsb_db, &sbrec_idl_class, false, true));
-    ovsdb_idl_set_binary_transport(ovnsb_idl_loop.idl, use_binary_transport);
 
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_chassis);
     ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_chassis_col_encaps);

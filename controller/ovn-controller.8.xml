@@ -140,30 +140,6 @@
         </p>
       </dd>
 
-      <dt><code>external_ids:ovn-binary-transport</code></dt>
-      <dd>
-        <p>
-          A boolean value that controls whether <code>ovn-controller</code>
-          uses binary transport for its connection to the
-          <code>OVN_Southbound</code> database.  When enabled,
-          <code>ovn-controller</code> negotiates binary format with the
-          server, which reduces serialization overhead and network bandwidth
-          for large databases.
-        </p>
-        <p>
-          Binary transport is fully backward compatible: if the server does
-          not support it, <code>ovn-controller</code> automatically falls
-          back to JSON format.
-        </p>
-        <p>
-          Set to <code>false</code> to disable binary transport, for
-          example when debugging protocol issues.
-        </p>
-        <p>
-          Default value is <var>true</var>.
-        </p>
-      </dd>
-
       <dt><code>external_ids:ovn-remote-probe-interval</code></dt>
       <dd>
         <p>

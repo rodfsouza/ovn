@@ -44,16 +44,6 @@
         its value is used as the default.  Otherwise, the default is
         <code>unix:@RUNDIR@/ovn_ic_sb_db.sock</code>.
       </dd>
-      <dt><code>--no-binary-transport</code></dt>
-      <dd>
-        <p>
-          Disables binary transport for all OVSDB connections.  By default,
-          <code>ovn-ic</code> negotiates binary format with the server to
-          reduce serialization overhead.  If the server does not support
-          binary transport, JSON format is used automatically regardless
-          of this option.
-        </p>
-      </dd>
     </dl>
     <p>
       <var>database</var> in the above options must be an OVSDB active or

@@ -62,17 +62,6 @@
           enabled (with 256 threads) and a warning is logged.
         </p>
       </dd>
-      <dt><code>--no-binary-transport</code></dt>
-      <dd>
-        <p>
-          Disables binary transport for OVSDB connections to the
-          <code>OVN_Northbound</code> and <code>OVN_Southbound</code>
-          databases.  By default, <code>ovn-northd</code> negotiates binary
-          format with the server to reduce serialization overhead.  If the
-          server does not support binary transport, JSON format is used
-          automatically regardless of this option.
-        </p>
-      </dd>
     </dl>
     <p>
       <var>database</var> in the above options must be an OVSDB active or
