@@ -986,8 +986,10 @@ ods_build_array_index(struct ovn_datapaths *datapaths)
      * doesn't matter if they are different on every iteration. */
     size_t index = 0;
 
+    size_t n = ods_size(datapaths);
     datapaths->array = xrealloc(datapaths->array,
-                            ods_size(datapaths) * sizeof *datapaths->array);
+                                n * sizeof *datapaths->array);
+    datapaths->n_array_alloc = n;
 
     struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, &datapaths->datapaths) {
@@ -1005,13 +1007,9 @@ static void
 ods_append_datapath(struct ovn_datapaths *datapaths, struct ovn_datapath *od)
 {
     size_t n = ods_size(datapaths);
-    VLOG_DBG("ods_append_datapath: ods_size=%"PRIuSIZE
-             " hmap_count=%"PRIuSIZE" router=%s assigning index=%"PRIuSIZE,
-             n, hmap_count(&datapaths->datapaths),
-             od->nbr ? od->nbr->name : "<null>",
-             n - 1);
     datapaths->array = xrealloc(datapaths->array,
                                 n * sizeof *datapaths->array);
+    datapaths->n_array_alloc = n;
     od->index = n - 1;
     datapaths->array[od->index] = od;
     od->datapaths = datapaths;
@@ -18766,6 +18764,7 @@ ovn_datapaths_init(struct ovn_datapaths *datapaths)
 {
     hmap_init(&datapaths->datapaths);
     datapaths->array = NULL;
+    datapaths->n_array_alloc = 0;
 }
 
 static void

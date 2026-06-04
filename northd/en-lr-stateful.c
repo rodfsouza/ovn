@@ -154,7 +154,7 @@ lr_stateful_northd_handler(struct engine_node *node, void *data_)
 
         data->table.array = xrealloc(
             data->table.array,
-            ods_size(input_data.lr_datapaths)
+            ods_array_size(input_data.lr_datapaths)
                 * sizeof *data->table.array);
 
         struct hmapx_node *hmapx_node;
@@ -434,8 +434,9 @@ lr_stateful_table_build(struct lr_stateful_table *table,
                         const struct hmap *lb_datapaths_map,
                         const struct hmap *lbgrp_datapaths_map)
 {
-    table->array = xrealloc(table->array,
-                            ods_size(lr_datapaths) * sizeof *table->array);
+    size_t n = ods_array_size(lr_datapaths);
+    table->array = xrealloc(table->array, n * sizeof *table->array);
+    memset(table->array, 0, n * sizeof *table->array);
     const struct lr_nat_record *lrnat_rec;
     LR_NAT_TABLE_FOR_EACH (lrnat_rec, lr_nats) {
         const struct ovn_datapath *od =

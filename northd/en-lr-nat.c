@@ -131,7 +131,7 @@ lr_nat_northd_handler(struct engine_node *node, void *data_)
     if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED) {
         data->lr_nats.array = xrealloc(
             data->lr_nats.array,
-            ods_size(&northd_data->lr_datapaths)
+            ods_array_size(&northd_data->lr_datapaths)
                 * sizeof *data->lr_nats.array);
 
         struct hmapx_node *hmapx_node;
@@ -193,33 +193,13 @@ static void
 lr_nat_table_build(struct lr_nat_table *table,
                    const struct ovn_datapaths *lr_datapaths)
 {
-    size_t n = ods_size(lr_datapaths);
+    size_t n = ods_array_size(lr_datapaths);
     table->array = xrealloc(table->array, n * sizeof *table->array);
+    memset(table->array, 0, n * sizeof *table->array);
 
-    size_t count = 0;
     const struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, &lr_datapaths->datapaths) {
-        if (od->index >= n) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
-            VLOG_ERR_RL(&rl, "lr_nat_table_build: od->index %"PRIuSIZE
-                        " >= array size %"PRIuSIZE
-                        " (hmap_count=%"PRIuSIZE", router=%s, "
-                        "od_datapaths_size=%"PRIuSIZE")",
-                        od->index, n,
-                        hmap_count(&lr_datapaths->datapaths),
-                        od->nbr ? od->nbr->name : "<null>",
-                        od->datapaths ? ods_size(od->datapaths) : 0);
-        }
-        ovs_assert(od->index < n);
         lr_nat_record_create(table, od);
-        count++;
-    }
-
-    if (count != n) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
-        VLOG_ERR_RL(&rl, "lr_nat_table_build: iterated %"PRIuSIZE
-                    " datapaths but ods_size=%"PRIuSIZE,
-                    count, n);
     }
 }
 

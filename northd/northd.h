@@ -79,12 +79,24 @@ struct ovn_datapaths {
 
     /* The array index of each element in 'datapaths'. */
     struct ovn_datapath **array;
+
+    /* Allocated size of 'array'.  This is the high watermark — it never
+     * decreases on incremental deletion so that downstream tables
+     * (lr_nat_table, lr_stateful_table) indexed by od->index always
+     * have enough room, even when gaps exist from deleted datapaths. */
+    size_t n_array_alloc;
 };
 
 static inline size_t
 ods_size(const struct ovn_datapaths *datapaths)
 {
     return hmap_count(&datapaths->datapaths);
+}
+
+static inline size_t
+ods_array_size(const struct ovn_datapaths *datapaths)
+{
+    return datapaths->n_array_alloc;
 }
 
 bool od_has_lb_vip(const struct ovn_datapath *od);
