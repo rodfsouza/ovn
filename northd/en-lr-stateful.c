@@ -355,7 +355,12 @@ lr_stateful_lr_nat_handler(struct engine_node *node, void *data_)
         engine_get_input_data("lr_nat", node);
 
     if (!lr_nat_has_tracked_data(&lr_nat_data->trk_data)) {
-        return false;
+        /* lr_nat may be EN_UPDATED without tracked data when new routers
+         * are created (lr_nat_northd_handler creates records but doesn't
+         * add them to crupdated).  The lr_stateful_northd_handler already
+         * created lr_stateful records for those routers, so there's
+         * nothing more to do here. */
+        return true;
     }
 
     struct lr_stateful_input input_data = lr_stateful_get_input_data(node);
