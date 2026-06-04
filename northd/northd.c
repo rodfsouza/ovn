@@ -14712,15 +14712,13 @@ build_arp_request_flows_for_lrouter(
 }
 
 static void
-build_lrouter_network_id_flows(
-        struct ovn_datapath *od, struct lflow_table *lflows,
+build_lrouter_network_id_flows_for_lrp(
+        const struct ovn_port *op, struct lflow_table *lflows,
         struct ds *match, struct ds *actions, struct lflow_ref *lflow_ref)
 {
-    const struct ovn_port *op;
     size_t network_id;
 
-    HMAP_FOR_EACH (op, dp_node, &od->ports) {
-        for (size_t i = 0; i < op->lrp_networks.n_ipv4_addrs; i++) {
+    for (size_t i = 0; i < op->lrp_networks.n_ipv4_addrs; i++) {
             if (i > OVN_MAX_NETWORK_ID) {
                 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
                 VLOG_WARN_RL(&rl, "Logical router port %s already has the max "
@@ -14783,6 +14781,17 @@ build_lrouter_network_id_flows(
             ovn_lflow_add(lflows, op->od, S_ROUTER_IN_NETWORK_ID, 110,
                           ds_cstr(match), ds_cstr(actions), lflow_ref);
         }
+}
+
+static void
+build_lrouter_network_id_flows(
+        struct ovn_datapath *od, struct lflow_table *lflows,
+        struct ds *match, struct ds *actions, struct lflow_ref *lflow_ref)
+{
+    const struct ovn_port *op;
+    HMAP_FOR_EACH (op, dp_node, &od->ports) {
+        build_lrouter_network_id_flows_for_lrp(op, lflows, match, actions,
+                                                lflow_ref);
     }
 
     /* Lower-priority flow for the case the next-hop doesn't belong to
@@ -17245,6 +17254,8 @@ build_lswitch_and_lrouter_iterate_by_lrp(struct ovn_port *op,
                                 lsi->meter_groups, op->lflow_ref);
     build_lrouter_icmp_packet_toobig_admin_flows(op, lsi->lflows, &lsi->match,
                                                  &lsi->actions, op->lflow_ref);
+    build_lrouter_network_id_flows_for_lrp(op, lsi->lflows, &lsi->match,
+                                            &lsi->actions, op->lflow_ref);
 }
 
 static void *
@@ -18053,35 +18064,6 @@ lflow_handle_northd_lr_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
             return false;
         }
     }
-
-    /* Regenerate network_id flows for routers that got new ports.
-     * build_lrouter_network_id_flows() iterates all ports on the router
-     * using od->lflow_ref.  The lflow system deduplicates existing flows;
-     * only the new port's network_id flow is actually added. */
-    struct hmapx updated_routers = HMAPX_INITIALIZER(&updated_routers);
-    HMAPX_FOR_EACH (hmapx_node, &trk_lrps->created) {
-        op = hmapx_node->data;
-        if (op->od && op->od->nbr && hmapx_add(&updated_routers, op->od)) {
-            struct ds match = DS_EMPTY_INITIALIZER;
-            struct ds actions = DS_EMPTY_INITIALIZER;
-            build_lrouter_network_id_flows(op->od, lflows, &match,
-                                            &actions, op->od->lflow_ref);
-            ds_destroy(&match);
-            ds_destroy(&actions);
-
-            if (!lflow_ref_sync_lflows(
-                    op->od->lflow_ref, lflows, ovnsb_txn,
-                    lflow_input->ls_datapaths,
-                    lflow_input->lr_datapaths,
-                    lflow_input->ovn_internal_version_changed,
-                    lflow_input->sbrec_logical_flow_table,
-                    lflow_input->sbrec_logical_dp_group_table)) {
-                hmapx_destroy(&updated_routers);
-                return false;
-            }
-        }
-    }
-    hmapx_destroy(&updated_routers);
 
     return true;
 }
