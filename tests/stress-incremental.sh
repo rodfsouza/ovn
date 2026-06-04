@@ -83,7 +83,7 @@ assert_row_count() {
     local table=$1 expected=$2
     shift 2
     local actual
-    actual=$(ovn-sbctl --no-headings --columns=_uuid find "$table" "$@" | grep -c uuid || true)
+    actual=$(ovn-sbctl --no-headings --columns=_uuid find "$table" "$@" | grep -c . || true)
     if [ "$actual" -eq "$expected" ]; then
         log_pass "SB $table count=$actual (expected $expected) $*"
     else
@@ -96,7 +96,7 @@ assert_nb_row_count() {
     local table=$1 expected=$2
     shift 2
     local actual
-    actual=$(ovn-nbctl --no-headings --columns=_uuid find "$table" "$@" | grep -c uuid || true)
+    actual=$(ovn-nbctl --no-headings --columns=_uuid find "$table" "$@" | grep -c . || true)
     if [ "$actual" -eq "$expected" ]; then
         log_pass "NB $table count=$actual (expected $expected) $*"
     else
@@ -374,9 +374,9 @@ echo "--- Phase 12: SB State Verification ---"
 # -------------------------------------------------------------------
 
 # Count total datapaths (routers)
-total_lr=$(ovn-nbctl --no-headings --columns=_uuid list Logical_Router | grep -c uuid || true)
-total_ls=$(ovn-nbctl --no-headings --columns=_uuid list Logical_Switch | grep -c uuid || true)
-total_dp=$(ovn-sbctl --no-headings --columns=_uuid list Datapath_Binding | grep -c uuid || true)
+total_lr=$(ovn-nbctl --no-headings --columns=_uuid list Logical_Router | grep -c . || true)
+total_ls=$(ovn-nbctl --no-headings --columns=_uuid list Logical_Switch | grep -c . || true)
+total_dp=$(ovn-sbctl --no-headings --columns=_uuid list Datapath_Binding | grep -c . || true)
 expected_dp=$((total_lr + total_ls))
 
 if [ "$total_dp" -eq "$expected_dp" ]; then
@@ -392,7 +392,7 @@ done
 
 # Verify Port_Bindings exist for router ports
 for rp in stress-rp6 stress-rp7 stress-bulk-rp1 stress-extra-rp6; do
-    count=$(ovn-sbctl --no-headings find Port_Binding logical_port="$rp" | grep -c uuid || true)
+    count=$(ovn-sbctl --no-headings find Port_Binding logical_port="$rp" | grep -c . || true)
     if [ "$count" -gt 0 ]; then
         log_pass "Port_Binding exists for $rp"
     else
@@ -402,7 +402,7 @@ done
 
 # Verify deleted ports are gone
 for rp in stress-extra-rp1 stress-extra-rp2 stress-extra-rp3; do
-    count=$(ovn-sbctl --no-headings find Port_Binding logical_port="$rp" | grep -c uuid || true)
+    count=$(ovn-sbctl --no-headings find Port_Binding logical_port="$rp" | grep -c . || true)
     if [ "$count" -eq 0 ]; then
         log_pass "Deleted Port_Binding gone for $rp"
     else
@@ -439,7 +439,7 @@ done
 log_info "Cleanup complete."
 
 # Verify everything is cleaned up
-remaining=$(ovn-sbctl --no-headings --columns=_uuid list Datapath_Binding | grep -c uuid || true)
+remaining=$(ovn-sbctl --no-headings --columns=_uuid list Datapath_Binding | grep -c . || true)
 if [ "$remaining" -eq 0 ]; then
     log_pass "All datapaths cleaned up ($remaining remaining)"
 else
