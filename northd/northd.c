@@ -5181,6 +5181,18 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             }
             sset_destroy(&active_ha_chassis_grps);
 
+            /* Track inline-created ports for downstream lflow handler.
+             * Without this, per-LRP flows (admission, neighbor learning,
+             * IP routing) are not generated incrementally — only
+             * router-level flows from build_lr_flows_for_datapath(). */
+            struct ovn_port *tracked_op;
+            HMAP_FOR_EACH (tracked_op, dp_node, &od->ports) {
+                hmapx_add(&nd->trk_data.trk_lrps.created, tracked_op);
+            }
+            if (!hmap_is_empty(&od->ports)) {
+                nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
+            }
+
             /* Track NATs if present. */
             if (changed_lr->n_nat > 0) {
                 hmapx_add(&nd->trk_data.trk_nat_lrs, od);
