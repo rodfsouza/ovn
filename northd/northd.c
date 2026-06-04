@@ -5320,15 +5320,40 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             /* Remove from lr_list. */
             ovs_list_remove(&od->lr_list);
 
+            /* Clear the deleted router from all LB bitmaps before
+             * destroying, so downstream recomputes don't reference
+             * the deleted index via stale bitmap bits. */
+            struct ovn_lb_datapaths *lb_dps_del;
+            HMAP_FOR_EACH (lb_dps_del, hmap_node,
+                           &nd->lb_datapaths_map) {
+                if (bitmap_is_set(lb_dps_del->nb_lr_map, od->index)) {
+                    bitmap_set0(lb_dps_del->nb_lr_map, od->index);
+                    lb_dps_del->n_nb_lr--;
+                }
+            }
+            struct ovn_lb_group_datapaths *lbg_dps_del;
+            HMAP_FOR_EACH (lbg_dps_del, hmap_node,
+                           &nd->lb_group_datapaths_map) {
+                if (lbg_dps_del->n_lr > 0) {
+                    for (size_t j = 0; j < lbg_dps_del->n_lr; j++) {
+                        if (lbg_dps_del->lr[j] == od) {
+                            lbg_dps_del->lr[j] =
+                                lbg_dps_del->lr[--lbg_dps_del->n_lr];
+                            break;
+                        }
+                    }
+                }
+            }
+
+            /* Null out the array slot.  Don't call
+             * ods_build_array_index() — reshuffling indices would
+             * invalidate LB bitmaps and dp_group references.
+             * The n_array_alloc high watermark ensures downstream
+             * arrays remain correctly sized despite the gap. */
+            nd->lr_datapaths.array[od->index] = NULL;
+
             /* Destroy the datapath (removes from lr_datapaths hmap). */
             ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
-
-            /* Reassign all indices to close the gap left by the
-             * deleted datapath.  This is safe because
-             * NORTHD_TRACKED_LR_DELETED forces full recompute of all
-             * downstream nodes (lr_nat, lr_stateful, lflow), so no
-             * downstream table retains stale index references. */
-            ods_build_array_index(&nd->lr_datapaths);
 
             /* Track deletion for downstream handlers. */
             nd->trk_data.type |= NORTHD_TRACKED_LR_DELETED;
