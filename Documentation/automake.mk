@@ -51,6 +51,8 @@ DOC_SOURCE = \
 	Documentation/internals/documentation.rst \
 	Documentation/internals/mailing-lists.rst \
 	Documentation/internals/maintainers.rst \
+	Documentation/internals/ovn-incremental-processing-architecture.md \
+	Documentation/internals/ovn-incremental-processing-plan.md \
 	Documentation/internals/ovs_submodule.rst \
 	Documentation/internals/patchwork.rst \
 	Documentation/internals/release-process.rst \
