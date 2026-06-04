@@ -277,9 +277,16 @@ lflow_lr_stateful_handler(struct engine_node *node, void *data)
     struct ed_type_lr_stateful *lr_sful_data =
         engine_get_input_data("lr_stateful", node);
 
-    if (!lr_stateful_has_tracked_data(&lr_sful_data->trk_data)
-        || lr_sful_data->trk_data.vip_nats_changed) {
+    if (lr_sful_data->trk_data.vip_nats_changed) {
         return false;
+    }
+
+    /* If lr_stateful was updated but has no tracked changes (e.g., new
+     * router creation), the flows are already handled by
+     * lflow_northd_handler via build_lr_flows_for_datapath(). */
+    if (!lr_stateful_has_tracked_data(&lr_sful_data->trk_data)) {
+        engine_set_node_state(node, EN_UPDATED);
+        return true;
     }
 
     const struct engine_context *eng_ctx = engine_get_context();

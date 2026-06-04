@@ -166,11 +166,9 @@ lr_stateful_northd_handler(struct engine_node *node, void *data_)
                 lr_nat_table_find_by_index(input_data.lr_nats, od->index);
             ovs_assert(lrnat_rec);
 
-            struct lr_stateful_record *lr_sful_rec =
-                lr_stateful_record_create(&data->table, lrnat_rec, od,
-                                           input_data.lb_datapaths_map,
-                                           input_data.lbgrp_datapaths_map);
-            hmapx_add(&data->trk_data.crupdated, lr_sful_rec);
+            lr_stateful_record_create(&data->table, lrnat_rec, od,
+                                       input_data.lb_datapaths_map,
+                                       input_data.lbgrp_datapaths_map);
         }
         engine_set_node_state(node, EN_UPDATED);
     }
