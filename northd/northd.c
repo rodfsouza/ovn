@@ -1005,6 +1005,11 @@ static void
 ods_append_datapath(struct ovn_datapaths *datapaths, struct ovn_datapath *od)
 {
     size_t n = ods_size(datapaths);
+    VLOG_DBG("ods_append_datapath: ods_size=%"PRIuSIZE
+             " hmap_count=%"PRIuSIZE" router=%s assigning index=%"PRIuSIZE,
+             n, hmap_count(&datapaths->datapaths),
+             od->nbr ? od->nbr->name : "<null>",
+             n - 1);
     datapaths->array = xrealloc(datapaths->array,
                                 n * sizeof *datapaths->array);
     od->index = n - 1;
