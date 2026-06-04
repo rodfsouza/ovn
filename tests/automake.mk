@@ -14,6 +14,7 @@ EXTRA_DIST += \
 	$(PERF_TESTSUITE) \
 	$(MULTINODE_TESTSUITE) \
 	tests/atlocal.in \
+	tests/stress-incremental.sh \
 	$(srcdir)/package.m4 \
 	$(srcdir)/tests/testsuite \
 	$(srcdir)/tests/testsuite.patch
