@@ -214,8 +214,6 @@ struct lr_nat_record *
 lr_nat_table_find_by_index_(const struct lr_nat_table *table,
                             size_t od_index)
 {
-    ovs_assert(od_index <= hmap_count(&table->entries));
-
     return table->array[od_index];
 }
 

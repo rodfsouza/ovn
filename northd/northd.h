@@ -411,7 +411,7 @@ static inline struct ovn_datapath *
 ovn_datapaths_find_by_index(const struct ovn_datapaths *ovn_datapaths,
                             size_t od_index)
 {
-    ovs_assert(od_index <= hmap_count(&ovn_datapaths->datapaths));
+    ovs_assert(od_index < ovn_datapaths->n_array_alloc);
     return ovn_datapaths->array[od_index];
 }
 

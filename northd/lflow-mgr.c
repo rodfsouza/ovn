@@ -1046,7 +1046,7 @@ sync_lflow_to_sb(struct ovn_lflow *lflow,
         size_t index = bitmap_scan(lflow->dpg_bitmap, true, 0,
                                     n_datapaths);
 
-        lflow->od = datapaths_array[index];
+        lflow->od = (index < n_datapaths) ? datapaths_array[index] : NULL;
         lflow->dpg = NULL;
     } else {
         lflow->od = NULL;
