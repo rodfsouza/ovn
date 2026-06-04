@@ -18054,6 +18054,35 @@ lflow_handle_northd_lr_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
         }
     }
 
+    /* Regenerate network_id flows for routers that got new ports.
+     * build_lrouter_network_id_flows() iterates all ports on the router
+     * using od->lflow_ref.  The lflow system deduplicates existing flows;
+     * only the new port's network_id flow is actually added. */
+    struct hmapx updated_routers = HMAPX_INITIALIZER(&updated_routers);
+    HMAPX_FOR_EACH (hmapx_node, &trk_lrps->created) {
+        op = hmapx_node->data;
+        if (op->od && op->od->nbr && hmapx_add(&updated_routers, op->od)) {
+            struct ds match = DS_EMPTY_INITIALIZER;
+            struct ds actions = DS_EMPTY_INITIALIZER;
+            build_lrouter_network_id_flows(op->od, lflows, &match,
+                                            &actions, op->od->lflow_ref);
+            ds_destroy(&match);
+            ds_destroy(&actions);
+
+            if (!lflow_ref_sync_lflows(
+                    op->od->lflow_ref, lflows, ovnsb_txn,
+                    lflow_input->ls_datapaths,
+                    lflow_input->lr_datapaths,
+                    lflow_input->ovn_internal_version_changed,
+                    lflow_input->sbrec_logical_flow_table,
+                    lflow_input->sbrec_logical_dp_group_table)) {
+                hmapx_destroy(&updated_routers);
+                return false;
+            }
+        }
+    }
+    hmapx_destroy(&updated_routers);
+
     return true;
 }
 
