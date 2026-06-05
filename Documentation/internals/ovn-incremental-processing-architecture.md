@@ -634,6 +634,98 @@ When `lr_group->n_router_dps > 1`, deleting a router requires
 rebuilding the group recursively via `build_lrouter_groups__()` for
 all remaining members. Falls back to full recompute.
 
+## 13. Datapath Indexing and Bitmap System
+
+### How dp_group Bitmaps Work
+
+Each datapath has an integer index into `datapaths->array`. Bitmaps use
+these indices as bit positions to represent sets of datapaths:
+
+```
+8 routers, indices 0-7:
+  array:  [R0][R1][R2][R3][R4][R5][R6][R7]    n_array_alloc = 8
+
+Flow "ip4.src == 10.0.0.0/8 → drop" applies to R0,R1,R2,R4,R6,R7:
+
+  dpg_bitmap: [1][1][1][0][1][0][1][1]
+               0   1   2  3   4  5   6  7
+
+  → ONE SB Logical_Flow + Logical_DP_Group = {R0,R1,R2,R4,R6,R7}
+  → Without dp_groups: 6 separate Logical_Flow rows
+```
+
+### Load Balancer Bitmaps (nb_lr_map)
+
+```
+LB "web-lb" associated with routers R1, R3, R5:
+
+  nb_lr_map: [0][1][0][1][0][1][0][0]
+              0   1  2   3  4   5  6  7
+
+  BITMAP_FOR_EACH_1(index, ods_array_size(), nb_lr_map):
+    → index=1 → array[1] = R1
+    → index=3 → array[3] = R3
+    → index=5 → array[5] = R5
+```
+
+### Incremental Creation (ods_append_datapath)
+
+```
+Before: 3 routers, n_array_alloc = 3
+  [R0][R1][R2]
+
+lr-add R3 → ods_append_datapath():
+  n = ods_size() = 4 (R3 already in hmap)
+  xrealloc(array, 4 * sizeof(ptr))
+  R3->index = 3, array[3] = R3, n_array_alloc = 4
+
+After: [R0][R1][R2][R3]   n_array_alloc = 4
+  Existing indices UNCHANGED → downstream tables valid
+```
+
+### Incremental Deletion (NULL gap + LB cleanup)
+
+```
+Before: 4 routers, n_array_alloc = 4
+  [R0][R1][R2][R3]
+
+lr-del R1:
+  1. Clear R1's bit from ALL LB bitmaps
+  2. array[1] = NULL (gap)
+  3. ovn_datapath_destroy() removes from hmap
+  4. n_array_alloc stays at 4 (high watermark)
+
+After: [R0][NULL][R2][R3]   n_array_alloc = 4, ods_size() = 3
+
+  ods_size() = 3      (hmap_count — for counting live datapaths)
+  ods_array_size() = 4 (n_array_alloc — for sizing index-based arrays)
+
+  WHY NOT reshuffle indices?
+  → LB bitmaps reference indices by position
+  → dp_group bitmaps reference indices
+  → Reshuffling invalidates ALL bitmaps
+  → Would need O(flows × datapaths) to remap every bitmap
+```
+
+### Why n_array_alloc Matters
+
+```
+After deleting R1: ods_size() = 3, but R3 has index 3
+
+  Downstream array allocation:
+    WRONG: xrealloc(array, ods_size() * sizeof(ptr))   → 3 elements
+           R3 at index 3 → OUT OF BOUNDS!
+
+    RIGHT: xrealloc(array, ods_array_size() * sizeof(ptr)) → 4 elements
+           R3 at index 3 → VALID
+
+  n_array_alloc is a HIGH WATERMARK:
+    - Set by ods_build_array_index() during full recompute
+    - Set by ods_append_datapath() during creation
+    - NEVER decreased during deletion
+    - Reset only on next full recompute
+```
+
 ### Binary UPDATE_BATCH (Phase D)
 
 Extend server to send incremental updates as binary frames.
