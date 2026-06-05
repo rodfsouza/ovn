@@ -990,6 +990,7 @@ ods_build_array_index(struct ovn_datapaths *datapaths)
     datapaths->array = xrealloc(datapaths->array,
                                 n * sizeof *datapaths->array);
     datapaths->n_array_alloc = n;
+    datapaths->n_mutations = 0;
 
     struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, &datapaths->datapaths) {
@@ -1010,9 +1011,58 @@ ods_append_datapath(struct ovn_datapaths *datapaths, struct ovn_datapath *od)
     datapaths->array = xrealloc(datapaths->array,
                                 n * sizeof *datapaths->array);
     datapaths->n_array_alloc = n;
+    datapaths->n_mutations++;
     od->index = n - 1;
     datapaths->array[od->index] = od;
     od->datapaths = datapaths;
+}
+
+/* LRP-to-LR map helpers for O(1) parent router lookup. */
+static void
+lrp_to_lr_map_add(struct hmap *map,
+                  const struct nbrec_logical_router_port *lrp,
+                  struct ovn_datapath *od)
+{
+    struct lrp_lr_map_entry *entry = xmalloc(sizeof *entry);
+    entry->lrp = lrp;
+    entry->od = od;
+    hmap_insert(map, &entry->hmap_node, hash_pointer(lrp, 0));
+}
+
+static struct ovn_datapath *
+lrp_to_lr_map_find(const struct hmap *map,
+                   const struct nbrec_logical_router_port *lrp)
+{
+    struct lrp_lr_map_entry *entry;
+    HMAP_FOR_EACH_WITH_HASH (entry, hmap_node, hash_pointer(lrp, 0), map) {
+        if (entry->lrp == lrp) {
+            return entry->od;
+        }
+    }
+    return NULL;
+}
+
+static void
+lrp_to_lr_map_remove(struct hmap *map,
+                     const struct nbrec_logical_router_port *lrp)
+{
+    struct lrp_lr_map_entry *entry;
+    HMAP_FOR_EACH_WITH_HASH (entry, hmap_node, hash_pointer(lrp, 0), map) {
+        if (entry->lrp == lrp) {
+            hmap_remove(map, &entry->hmap_node);
+            free(entry);
+            return;
+        }
+    }
+}
+
+static void
+lrp_to_lr_map_clear(struct hmap *map)
+{
+    struct lrp_lr_map_entry *entry;
+    HMAP_FOR_EACH_POP (entry, hmap_node, map) {
+        free(entry);
+    }
 }
 
 /* Updates the southbound Datapath_Binding table so that it contains the
@@ -5034,6 +5084,13 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
                          const struct northd_input *ni,
                          struct northd_data *nd)
 {
+    /* If too many incremental mutations have accumulated, force a
+     * full recompute to compact the array and reclaim gap slots. */
+#define ODS_MUTATION_LIMIT 1000
+    if (nd->lr_datapaths.n_mutations > ODS_MUTATION_LIMIT) {
+        goto fail;
+    }
+
     const struct nbrec_logical_router *changed_lr;
 
     NBREC_LOGICAL_ROUTER_TABLE_FOR_EACH_TRACKED (changed_lr,
@@ -5191,6 +5248,12 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             }
             if (!hmap_is_empty(&od->ports)) {
                 nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
+            }
+
+            /* Add inline-created ports to LRP-to-LR map. */
+            for (size_t i = 0; i < changed_lr->n_ports; i++) {
+                lrp_to_lr_map_add(&nd->lrp_to_lr_map,
+                                  changed_lr->ports[i], od);
             }
 
             /* Track NATs if present. */
@@ -5351,6 +5414,7 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
              * The n_array_alloc high watermark ensures downstream
              * arrays remain correctly sized despite the gap. */
             nd->lr_datapaths.array[od->index] = NULL;
+            nd->lr_datapaths.n_mutations++;
 
             /* Destroy the datapath (removes from lr_datapaths hmap). */
             ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
@@ -5452,21 +5516,9 @@ northd_handle_lrp_changes(
                 return false;
             }
 
-            /* Find parent router by iterating lr_datapaths. */
-            struct ovn_datapath *parent_od = NULL;
-            struct ovn_datapath *od_iter;
-            HMAP_FOR_EACH (od_iter, key_node,
-                           &nd->lr_datapaths.datapaths) {
-                for (size_t i = 0; i < od_iter->nbr->n_ports; i++) {
-                    if (od_iter->nbr->ports[i] == changed_lrp) {
-                        parent_od = od_iter;
-                        break;
-                    }
-                }
-                if (parent_od) {
-                    break;
-                }
-            }
+            /* O(1) parent router lookup via lrp_to_lr_map. */
+            struct ovn_datapath *parent_od =
+                lrp_to_lr_map_find(&nd->lrp_to_lr_map, changed_lrp);
 
             if (!parent_od) {
                 /* Parent not found — new router handled by C.6. */
@@ -5539,6 +5591,10 @@ northd_handle_lrp_changes(
             hmapx_add(&nd->trk_data.trk_lrps.created, op);
             nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
 
+            /* Add to LRP-to-LR map. */
+            lrp_to_lr_map_add(&nd->lrp_to_lr_map, changed_lrp,
+                              parent_od);
+
         } else if (nbrec_logical_router_port_is_deleted(changed_lrp)) {
             struct ovn_port *op = ovn_port_find(
                 &nd->lr_ports, changed_lrp->name);
@@ -5558,6 +5614,21 @@ northd_handle_lrp_changes(
 
             /* Disconnect peer and mark for flow update. */
             if (op->peer) {
+                /* Remove peer from parent switch's router_ports array.
+                 * O(P) where P = router ports on the switch (typically
+                 * 1-5). */
+                struct ovn_datapath *peer_od = op->peer->od;
+                if (peer_od) {
+                    for (size_t j = 0; j < peer_od->n_router_ports; j++) {
+                        if (peer_od->router_ports[j] == op->peer) {
+                            peer_od->router_ports[j] =
+                                peer_od->router_ports[
+                                    --peer_od->n_router_ports];
+                            break;
+                        }
+                    }
+                }
+
                 op->peer->peer = NULL;
                 hmapx_add(&nd->trk_data.trk_lsps.updated, op->peer);
                 nd->trk_data.type |= NORTHD_TRACKED_PORTS;
@@ -5579,6 +5650,9 @@ northd_handle_lrp_changes(
 
             hmapx_add(&nd->trk_data.trk_lrps.deleted, op);
             nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
+
+            /* Remove from LRP-to-LR map. */
+            lrp_to_lr_map_remove(&nd->lrp_to_lr_map, changed_lrp);
 
         } else {
             /* Modified LRP — fall back to recompute. */
@@ -18018,10 +18092,6 @@ lflow_handle_northd_lr_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
         op = hmapx_node->data;
         ovs_assert(op->nbrp);
 
-        /* Only fields used by build_lswitch_and_lrouter_iterate_by_lrp
-         * and build_lbnat_lflows_iterate_by_lrp are initialized.
-         * Fields like features, igmp_groups, svc_monitor_map, etc.
-         * are zero (NULL) and not accessed by the per-LRP builders. */
         struct lswitch_flow_build_info lsi = {
             .ls_datapaths = lflow_input->ls_datapaths,
             .lr_datapaths = lflow_input->lr_datapaths,
@@ -18030,6 +18100,11 @@ lflow_handle_northd_lr_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
             .lr_stateful_table = lflow_input->lr_stateful_table,
             .lflows = lflows,
             .meter_groups = lflow_input->meter_groups,
+            .features = lflow_input->features,
+            .svc_monitor_mac = lflow_input->svc_monitor_mac,
+            .svc_monitor_map = lflow_input->svc_monitor_map,
+            .lb_dps_map = lflow_input->lb_datapaths_map,
+            .bfd_connections = lflow_input->bfd_connections,
             .match = DS_EMPTY_INITIALIZER,
             .actions = DS_EMPTY_INITIALIZER,
         };
@@ -18814,6 +18889,7 @@ ovn_datapaths_init(struct ovn_datapaths *datapaths)
     hmap_init(&datapaths->datapaths);
     datapaths->array = NULL;
     datapaths->n_array_alloc = 0;
+    datapaths->n_mutations = 0;
 }
 
 static void
@@ -18875,6 +18951,7 @@ northd_init(struct northd_data *data)
     hmap_init(&data->lr_ports);
     hmap_init(&data->lb_datapaths_map);
     hmap_init(&data->lb_group_datapaths_map);
+    hmap_init(&data->lrp_to_lr_map);
     ovs_list_init(&data->lr_list);
     sset_init(&data->svc_monitor_lsps);
     hmap_init(&data->svc_monitor_map);
@@ -18911,6 +18988,9 @@ northd_destroy(struct northd_data *data)
      * as well.
      */
     cleanup_macam();
+
+    lrp_to_lr_map_clear(&data->lrp_to_lr_map);
+    hmap_destroy(&data->lrp_to_lr_map);
 
     destroy_datapaths_and_ports(&data->ls_datapaths, &data->lr_datapaths,
                                 &data->ls_ports, &data->lr_ports,
@@ -18957,6 +19037,18 @@ ovnnb_db_run(struct northd_input *input_data,
                     input_data->sbrec_chassis_table,
                     &data->ls_datapaths,
                     &data->lr_datapaths, &data->lr_list);
+    /* Populate LRP-to-LR map for O(1) parent lookup in handlers. */
+    lrp_to_lr_map_clear(&data->lrp_to_lr_map);
+    struct ovn_datapath *lr_od;
+    HMAP_FOR_EACH (lr_od, key_node, &data->lr_datapaths.datapaths) {
+        if (lr_od->nbr) {
+            for (size_t i = 0; i < lr_od->nbr->n_ports; i++) {
+                lrp_to_lr_map_add(&data->lrp_to_lr_map,
+                                  lr_od->nbr->ports[i], lr_od);
+            }
+        }
+    }
+
     build_lb_datapaths(input_data->lbs, input_data->lbgrps,
                        &data->ls_datapaths, &data->lr_datapaths,
                        &data->lb_datapaths_map, &data->lb_group_datapaths_map);

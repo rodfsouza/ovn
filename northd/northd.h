@@ -85,6 +85,12 @@ struct ovn_datapaths {
      * (lr_nat_table, lr_stateful_table) indexed by od->index always
      * have enough room, even when gaps exist from deleted datapaths. */
     size_t n_array_alloc;
+
+    /* Mutation counter.  Incremented on each incremental add/delete.
+     * Reset to 0 by ods_build_array_index() (full recompute compaction).
+     * When this exceeds ODS_MUTATION_LIMIT, the handler forces a
+     * recompute to compact the array and reclaim gap slots. */
+    size_t n_mutations;
 };
 
 static inline size_t
@@ -191,6 +197,13 @@ struct northd_tracked_data {
     struct hmapx lr_with_changed_policies;
 };
 
+/* Maps nbrec_logical_router_port → parent ovn_datapath for O(1) lookup. */
+struct lrp_lr_map_entry {
+    struct hmap_node hmap_node;
+    const struct nbrec_logical_router_port *lrp;
+    struct ovn_datapath *od;
+};
+
 struct northd_data {
     /* Global state for 'en-northd'. */
     struct ovn_datapaths ls_datapaths;
@@ -202,6 +215,7 @@ struct northd_data {
     struct ovs_list lr_list;
     struct sset svc_monitor_lsps;
     struct hmap svc_monitor_map;
+    struct hmap lrp_to_lr_map;  /* struct lrp_lr_map_entry, by LRP ptr */
 
     /* Change tracking data. */
     struct northd_tracked_data trk_data;

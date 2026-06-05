@@ -603,25 +603,5 @@ static bool
 chassis_features_changed(const struct chassis_features *present,
                          const struct chassis_features *updated)
 {
-    if (present->ct_no_masked_label != updated->ct_no_masked_label) {
-        return true;
-    }
-
-    if (present->mac_binding_timestamp != updated->mac_binding_timestamp) {
-        return true;
-    }
-
-    if (present->ct_lb_related != updated->ct_lb_related) {
-        return true;
-    }
-
-    if (present->fdb_timestamp != updated->fdb_timestamp) {
-        return true;
-    }
-
-    if (present->ls_dpg_column != updated->ls_dpg_column) {
-        return true;
-    }
-
-    return false;
+    return memcmp(present, updated, sizeof *present) != 0;
 }
