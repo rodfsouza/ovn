@@ -5430,6 +5430,25 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             goto fail;
         }
 
+        /* If the ports column changed, update the LRP-to-LR map for
+         * any new LRPs.  The LRP handler runs after us and needs the
+         * map to find the parent router in O(1). */
+        if (nbrec_logical_router_is_updated(changed_lr,
+                NBREC_LOGICAL_ROUTER_COL_PORTS)) {
+            struct ovn_datapath *od = ovn_datapath_find_(
+                &nd->lr_datapaths.datapaths,
+                &changed_lr->header_.uuid);
+            if (od) {
+                for (size_t i = 0; i < changed_lr->n_ports; i++) {
+                    if (!lrp_to_lr_map_find(&nd->lrp_to_lr_map,
+                                             changed_lr->ports[i])) {
+                        lrp_to_lr_map_add(&nd->lrp_to_lr_map,
+                                          changed_lr->ports[i], od);
+                    }
+                }
+            }
+        }
+
         if (is_lr_nats_changed(changed_lr)) {
             struct ovn_datapath *od = ovn_datapath_find_(
                                     &nd->lr_datapaths.datapaths,
