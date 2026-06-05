@@ -93,6 +93,8 @@ struct ovn_datapaths {
     size_t n_mutations;
 };
 
+#define ODS_MUTATION_LIMIT 1000
+
 static inline size_t
 ods_size(const struct ovn_datapaths *datapaths)
 {

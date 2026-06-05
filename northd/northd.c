@@ -5086,7 +5086,6 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
 {
     /* If too many incremental mutations have accumulated, force a
      * full recompute to compact the array and reclaim gap slots. */
-#define ODS_MUTATION_LIMIT 1000
     if (nd->lr_datapaths.n_mutations > ODS_MUTATION_LIMIT) {
         goto fail;
     }
@@ -5252,8 +5251,11 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
 
             /* Add inline-created ports to LRP-to-LR map. */
             for (size_t i = 0; i < changed_lr->n_ports; i++) {
-                lrp_to_lr_map_add(&nd->lrp_to_lr_map,
-                                  changed_lr->ports[i], od);
+                if (!lrp_to_lr_map_find(&nd->lrp_to_lr_map,
+                                         changed_lr->ports[i])) {
+                    lrp_to_lr_map_add(&nd->lrp_to_lr_map,
+                                      changed_lr->ports[i], od);
+                }
             }
 
             /* Track NATs if present. */
@@ -5354,6 +5356,11 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
 
                 if (op->peer) {
                     op->peer->peer = NULL;
+                }
+
+                /* Remove from LRP-to-LR map before destroying. */
+                if (op->nbrp) {
+                    lrp_to_lr_map_remove(&nd->lrp_to_lr_map, op->nbrp);
                 }
 
                 hmap_remove(&nd->lr_ports, &op->key_node);
@@ -5610,9 +5617,11 @@ northd_handle_lrp_changes(
             hmapx_add(&nd->trk_data.trk_lrps.created, op);
             nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
 
-            /* Add to LRP-to-LR map. */
-            lrp_to_lr_map_add(&nd->lrp_to_lr_map, changed_lrp,
-                              parent_od);
+            /* Add to LRP-to-LR map (may already exist from LR handler). */
+            if (!lrp_to_lr_map_find(&nd->lrp_to_lr_map, changed_lrp)) {
+                lrp_to_lr_map_add(&nd->lrp_to_lr_map, changed_lrp,
+                                  parent_od);
+            }
 
         } else if (nbrec_logical_router_port_is_deleted(changed_lrp)) {
             struct ovn_port *op = ovn_port_find(
