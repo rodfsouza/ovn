@@ -603,5 +603,13 @@ static bool
 chassis_features_changed(const struct chassis_features *present,
                          const struct chassis_features *updated)
 {
-    return memcmp(present, updated, sizeof *present) != 0;
+    return present->ct_no_masked_label != updated->ct_no_masked_label
+        || present->mac_binding_timestamp != updated->mac_binding_timestamp
+        || present->ct_lb_related != updated->ct_lb_related
+        || present->fdb_timestamp != updated->fdb_timestamp
+        || present->ls_dpg_column != updated->ls_dpg_column
+        || present->ct_commit_nat_v2 != updated->ct_commit_nat_v2
+        || present->ct_commit_to_zone != updated->ct_commit_to_zone
+        || present->ct_next_zone != updated->ct_next_zone
+        || present->ct_state_save != updated->ct_state_save;
 }
