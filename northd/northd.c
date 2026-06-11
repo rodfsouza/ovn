@@ -458,6 +458,7 @@ ovn_datapath_create(struct hmap *datapaths, const struct uuid *key,
     od->lflow_ref = lflow_ref_create();
     od->route_lflow_ref = lflow_ref_create();
     od->policy_lflow_ref = lflow_ref_create();
+    hmap_init(&od->route_refs);
     return od;
 }
 
@@ -490,6 +491,14 @@ ovn_datapath_destroy(struct hmap *datapaths, struct ovn_datapath *od)
         lflow_ref_destroy(od->lflow_ref);
         lflow_ref_destroy(od->route_lflow_ref);
         lflow_ref_destroy(od->policy_lflow_ref);
+
+        struct route_flow_ref *rfr;
+        HMAP_FOR_EACH_POP (rfr, hmap_node, &od->route_refs) {
+            lflow_ref_destroy(rfr->lflow_ref);
+            free(rfr);
+        }
+        hmap_destroy(&od->route_refs);
+
         free(od);
     }
 }
@@ -1058,6 +1067,47 @@ lrp_to_lr_map_remove(struct hmap *map,
             free(entry);
             return;
         }
+    }
+}
+
+/* Per-route flow ref helpers. */
+struct route_flow_ref *
+route_flow_ref_find(const struct hmap *route_refs, const struct uuid *uuid)
+{
+    struct route_flow_ref *rfr;
+    HMAP_FOR_EACH_WITH_HASH (rfr, hmap_node, uuid_hash(uuid), route_refs) {
+        if (uuid_equals(&rfr->route_uuid, uuid)) {
+            return rfr;
+        }
+    }
+    return NULL;
+}
+
+struct route_flow_ref *
+route_flow_ref_create(struct hmap *route_refs, const struct uuid *uuid)
+{
+    struct route_flow_ref *rfr = xmalloc(sizeof *rfr);
+    rfr->route_uuid = *uuid;
+    rfr->lflow_ref = lflow_ref_create();
+    hmap_insert(route_refs, &rfr->hmap_node, uuid_hash(uuid));
+    return rfr;
+}
+
+void
+route_flow_ref_destroy(struct hmap *route_refs, struct route_flow_ref *rfr)
+{
+    hmap_remove(route_refs, &rfr->hmap_node);
+    lflow_ref_destroy(rfr->lflow_ref);
+    free(rfr);
+}
+
+static void
+route_flow_refs_clear(struct hmap *route_refs)
+{
+    struct route_flow_ref *rfr;
+    HMAP_FOR_EACH_POP (rfr, hmap_node, route_refs) {
+        lflow_ref_destroy(rfr->lflow_ref);
+        free(rfr);
     }
 }
 
@@ -4447,6 +4497,11 @@ destroy_northd_data_tracked_changes(struct northd_data *nd)
     hmapx_clear(&trk_changes->trk_created_lrs);
     hmapx_clear(&trk_changes->trk_deleted_lrs);
     hmapx_clear(&trk_changes->lr_with_changed_routes);
+    hmapx_clear(&trk_changes->routes_added);
+    struct route_del_entry *rde;
+    LIST_FOR_EACH_POP (rde, list_node, &trk_changes->routes_deleted) {
+        free(rde);
+    }
     hmapx_clear(&trk_changes->lr_with_changed_policies);
     trk_changes->type = NORTHD_TRACKED_NONE;
 }
@@ -4469,6 +4524,8 @@ init_northd_tracked_data(struct northd_data *nd)
     hmapx_init(&trk_data->trk_created_lrs);
     hmapx_init(&trk_data->trk_deleted_lrs);
     hmapx_init(&trk_data->lr_with_changed_routes);
+    hmapx_init(&trk_data->routes_added);
+    ovs_list_init(&trk_data->routes_deleted);
     hmapx_init(&trk_data->lr_with_changed_policies);
 }
 
@@ -4490,6 +4547,11 @@ destroy_northd_tracked_data(struct northd_data *nd)
     hmapx_destroy(&trk_data->trk_created_lrs);
     hmapx_destroy(&trk_data->trk_deleted_lrs);
     hmapx_destroy(&trk_data->lr_with_changed_routes);
+    hmapx_destroy(&trk_data->routes_added);
+    struct route_del_entry *rde;
+    LIST_FOR_EACH_POP (rde, list_node, &trk_data->routes_deleted) {
+        free(rde);
+    }
     hmapx_destroy(&trk_data->lr_with_changed_policies);
 }
 
@@ -5562,23 +5624,47 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 }
             }
 
-            /* Update route_to_lr_map for add/remove.
+            /* Update route_to_lr_map and detect per-route changes.
              * O(total_routes) scan to find entries for this od.
              * Acceptable because route column changes are infrequent.
              * TODO: per-router route list for O(routes_on_router). */
             if (nbrec_logical_router_is_updated(changed_lr,
                     NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES)) {
+                /* Build set of current route pointers for diff. */
+                struct hmapx current = HMAPX_INITIALIZER(&current);
+                for (size_t i = 0; i < changed_lr->n_static_routes; i++) {
+                    hmapx_add(&current, changed_lr->static_routes[i]);
+                }
+
+                /* Find deleted routes (in old map but not current). */
                 struct route_lr_map_entry *e;
                 HMAP_FOR_EACH_SAFE (e, hmap_node, &nd->route_to_lr_map) {
                     if (e->od == od) {
+                        if (!hmapx_contains(&current, e->route)) {
+                            struct route_del_entry *rde =
+                                xmalloc(sizeof *rde);
+                            rde->route_uuid = e->route->header_.uuid;
+                            rde->od = od;
+                            ovs_list_push_back(
+                                &nd->trk_data.routes_deleted,
+                                &rde->list_node);
+                        }
                         hmap_remove(&nd->route_to_lr_map, &e->hmap_node);
                         free(e);
                     }
                 }
+
+                /* Find added routes (in current but not old map). */
                 for (size_t i = 0; i < changed_lr->n_static_routes; i++) {
+                    if (!route_to_lr_map_find(&nd->route_to_lr_map,
+                                               changed_lr->static_routes[i])) {
+                        hmapx_add(&nd->trk_data.routes_added,
+                                  changed_lr->static_routes[i]);
+                    }
                     route_to_lr_map_add(&nd->route_to_lr_map,
                                         changed_lr->static_routes[i], od);
                 }
+                hmapx_destroy(&current);
             }
 
             hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
@@ -14068,19 +14154,97 @@ build_static_route_flows_for_lrouter(
         }
     }
     HMAP_FOR_EACH (group, hmap_node, &ecmp_groups) {
-        /* add a flow in IP_ROUTING, and one flow for each member in
-         * IP_ROUTING_ECMP. */
+        /* ECMP routes use the router-level route_lflow_ref (Phase 1). */
         build_ecmp_route_flow(lflows, od, features->ct_no_masked_label,
                               lr_ports, group, lflow_ref);
     }
+    /* Clear old per-route refs before repopulating. */
+    route_flow_refs_clear(&od->route_refs);
+
     const struct unique_routes_node *ur;
     HMAP_FOR_EACH (ur, hmap_node, &unique_routes) {
-        build_static_route_flow(lflows, od, lr_ports, ur->route, lflow_ref);
+        /* Each unique (non-ECMP) route gets its own lflow_ref so it
+         * can be added/removed independently during incremental
+         * processing without rebuilding all routes. */
+        struct route_flow_ref *rfr = route_flow_ref_create(
+            &od->route_refs, &ur->route->route->header_.uuid);
+        build_static_route_flow(lflows, od, lr_ports, ur->route,
+                                rfr->lflow_ref);
     }
     ecmp_groups_destroy(&ecmp_groups);
     unique_routes_destroy(&unique_routes);
     parsed_routes_destroy(&parsed_routes);
     simap_destroy(&route_tables);
+}
+
+/* Build flows for a single non-ECMP static route, tracked by the given
+ * per-route lflow_ref.  Used during per-route incremental processing. */
+void
+build_single_route_flows(struct ovn_datapath *od,
+                         const struct nbrec_logical_router_static_route *route,
+                         struct lflow_table *lflows,
+                         const struct hmap *lr_ports,
+                         struct lflow_ref *per_route_ref)
+{
+    struct ovs_list parsed_routes = OVS_LIST_INITIALIZER(&parsed_routes);
+    struct simap route_tables = SIMAP_INITIALIZER(&route_tables);
+
+    struct parsed_route *pr = parsed_routes_add(
+        od, lr_ports, &parsed_routes, &route_tables,
+        route, NULL);
+    if (pr) {
+        build_static_route_flow(lflows, od, lr_ports, pr, per_route_ref);
+    }
+
+    parsed_routes_destroy(&parsed_routes);
+    simap_destroy(&route_tables);
+}
+
+/* Check if a route shares an ECMP key with any other route on the same
+ * router.  Returns true if the route is part of (or would join) an ECMP
+ * group, meaning per-route incremental cannot be used. */
+bool
+route_affects_ecmp(const struct ovn_datapath *od,
+                   const struct nbrec_logical_router_static_route *route,
+                   const struct hmap *lr_ports)
+{
+    struct ovs_list parsed_routes = OVS_LIST_INITIALIZER(&parsed_routes);
+    struct simap route_tables = SIMAP_INITIALIZER(&route_tables);
+    bool affects = false;
+
+    struct parsed_route *target = parsed_routes_add(
+        (struct ovn_datapath *) od, lr_ports, &parsed_routes,
+        &route_tables, route, NULL);
+    if (!target) {
+        goto out;
+    }
+
+    if (target->ecmp_symmetric_reply) {
+        affects = true;
+        goto out;
+    }
+
+    for (size_t i = 0; i < od->nbr->n_static_routes; i++) {
+        if (od->nbr->static_routes[i] == route) {
+            continue;
+        }
+        struct parsed_route *other = parsed_routes_add(
+            (struct ovn_datapath *) od, lr_ports, &parsed_routes,
+            &route_tables, od->nbr->static_routes[i], NULL);
+        if (other && other->hash == target->hash
+            && ipv6_addr_equals(&other->prefix, &target->prefix)
+            && other->plen == target->plen
+            && other->is_src_route == target->is_src_route
+            && other->route_table_id == target->route_table_id) {
+            affects = true;
+            goto out;
+        }
+    }
+
+out:
+    parsed_routes_destroy(&parsed_routes);
+    simap_destroy(&route_tables);
+    return affects;
 }
 
 /* IP Multicast lookup. Here we set the output port, adjust TTL and
