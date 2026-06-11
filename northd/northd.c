@@ -11523,24 +11523,7 @@ build_route_table_lflow(struct ovn_datapath *od, struct lflow_table *lflows,
     ds_destroy(&actions);
 }
 
-struct parsed_route {
-    struct ovs_list list_node;
-    struct in6_addr prefix;
-    unsigned int plen;
-    bool is_src_route;
-    uint32_t route_table_id;
-    uint32_t hash;
-    const struct nbrec_logical_router_static_route *route;
-    bool ecmp_symmetric_reply;
-    bool is_discard_route;
-};
-
-static uint32_t
-route_hash(struct parsed_route *route)
-{
-    return hash_bytes(&route->prefix, sizeof route->prefix,
-                      (uint32_t)route->plen);
-}
+/* struct parsed_route and route_hash() are defined in northd.h */
 
 static bool
 find_static_route_outport(struct ovn_datapath *od, const struct hmap *lr_ports,
@@ -11549,7 +11532,7 @@ find_static_route_outport(struct ovn_datapath *od, const struct hmap *lr_ports,
 
 /* Parse and validate the route. Return the parsed route if successful.
  * Otherwise return NULL. */
-static struct parsed_route *
+struct parsed_route *
 parsed_routes_add(struct ovn_datapath *od, const struct hmap *lr_ports,
                   struct ovs_list *routes, struct simap *route_tables,
                   const struct nbrec_logical_router_static_route *route,
@@ -11645,7 +11628,7 @@ parsed_routes_add(struct ovn_datapath *od, const struct hmap *lr_ports,
     return pr;
 }
 
-static void
+void
 parsed_routes_destroy(struct ovs_list *routes)
 {
     struct parsed_route *pr;

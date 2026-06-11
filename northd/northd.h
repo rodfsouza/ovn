@@ -835,6 +835,34 @@ bool lflow_handle_northd_lb_changes(struct ovsdb_idl_txn *ovnsb_txn,
                                     struct tracked_lbs *,
                                     struct lflow_input *,
                                     struct lflow_table *lflows);
+/* Parsed static route — used by northd.c and en-group-ecmp-route.c. */
+struct parsed_route {
+    struct ovs_list list_node;
+    struct in6_addr prefix;
+    unsigned int plen;
+    bool is_src_route;
+    uint32_t route_table_id;
+    uint32_t hash;
+    const struct nbrec_logical_router_static_route *route;
+    bool ecmp_symmetric_reply;
+    bool is_discard_route;
+};
+
+static inline uint32_t
+route_hash(struct parsed_route *route)
+{
+    return hash_bytes(&route->prefix, sizeof route->prefix,
+                      (uint32_t)route->plen);
+}
+
+/* Parsed route helpers (used by en-group-ecmp-route.c). */
+struct parsed_route *parsed_routes_add(
+    struct ovn_datapath *od, const struct hmap *lr_ports,
+    struct ovs_list *routes, struct simap *route_tables,
+    const struct nbrec_logical_router_static_route *route,
+    const struct hmap *bfd_connections);
+void parsed_routes_destroy(struct ovs_list *routes);
+
 /* Per-route flow ref helpers (used by en-lflow.c). */
 struct route_flow_ref *route_flow_ref_find(const struct hmap *route_refs,
                                            const struct uuid *uuid);

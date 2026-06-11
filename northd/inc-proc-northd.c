@@ -36,6 +36,7 @@
 #include "en-lr-nat.h"
 #include "en-ls-stateful.h"
 #include "en-northd.h"
+#include "en-group-ecmp-route.h"
 #include "en-lflow.h"
 #include "en-northd-output.h"
 #include "en-meters.h"
@@ -142,6 +143,7 @@ enum sb_engine_node {
  * avoid sparse errors. */
 static ENGINE_NODE_WITH_CLEAR_TRACK_DATA(northd, "northd");
 static ENGINE_NODE(sync_from_sb, "sync_from_sb");
+static ENGINE_NODE_WITH_CLEAR_TRACK_DATA(group_ecmp_route, "group_ecmp_route");
 static ENGINE_NODE(lflow, "lflow");
 static ENGINE_NODE(mac_binding_aging, "mac_binding_aging");
 static ENGINE_NODE(mac_binding_aging_waker, "mac_binding_aging_waker");
@@ -266,6 +268,10 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_sync_meters, &en_nb_meter, NULL);
     engine_add_input(&en_sync_meters, &en_sb_meter, NULL);
 
+    /* group_ecmp_route preprocesses ECMP grouping from northd data.
+     * NULL handler means any northd change triggers ECMP regroup. */
+    engine_add_input(&en_group_ecmp_route, &en_northd, NULL);
+
     engine_add_input(&en_lflow, &en_nb_bfd, NULL);
     engine_add_input(&en_lflow, &en_nb_acl, NULL);
     engine_add_input(&en_lflow, &en_sync_meters, NULL);
@@ -285,6 +291,7 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_lflow, &en_global_config,
                      node_global_config_handler);
     engine_add_input(&en_lflow, &en_northd, lflow_northd_handler);
+    engine_add_input(&en_lflow, &en_group_ecmp_route, NULL);
     engine_add_input(&en_lflow, &en_port_group, lflow_port_group_handler);
     engine_add_input(&en_lflow, &en_lr_stateful, lflow_lr_stateful_handler);
     engine_add_input(&en_lflow, &en_ls_stateful, lflow_ls_stateful_handler);

@@ -10,6 +10,8 @@ northd_ovn_northd_SOURCES = \
 	northd/ovn-northd.c \
 	northd/en-global-config.c \
 	northd/en-global-config.h \
+	northd/en-group-ecmp-route.c \
+	northd/en-group-ecmp-route.h \
 	northd/en-northd.c \
 	northd/en-northd.h \
 	northd/en-lflow.c \
