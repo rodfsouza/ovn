@@ -10943,7 +10943,7 @@ CHECK_NO_CHANGE_AFTER_RECOMPUTE
 # Test lrp
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lrp-add lr0 lrp 00:00:02:01:02:03 10.0.0.1/24
-check_recompute_counter 1 1
+check_recompute_counter 0 0
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 # Set some options on 'lrp'.  northd should only recompute once.
@@ -10957,20 +10957,23 @@ check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lrp-set-gateway-chassis lrp hv1
 wait_column "hosting-chassis=hv1" nb:Logical_Router_Port status name=lrp
 
-# There will be 3 recomputes of northd engine node
-#   1. missing handler for input NB_logical_router
-#   2. missing handler for input SB_ha_chassis_group
-#   3. missing handler for input NB_logical_router when ovn-northd
-#      updates the hosting-chassis option in NB_logical_router_port.
-check_recompute_counter 3 3
+# There will be 2 recomputes of northd engine node
+#   1. LRP modification (gateway_chassis column) triggers recompute.
+#   2. sync_from_sb writes hosting-chassis to LRP status, which
+#      triggers another recompute (self-terminates because the
+#      next setkey is a no-op).
+#   SB_ha_chassis_group uses noop_handler (write-only table).
+check_recompute_counter 2 2
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb clear logical_router_port lrp gateway_chassis
-# There will be 2 recomputes of northd engine node
-#   1. missing handler for input NB_logical_router
-#   2. missing handler for input SB_ha_chassis_group
-check_recompute_counter 2 2
+# There will be 1 recompute of northd engine node
+#   1. LRP modification (gateway_chassis column cleared) triggers recompute.
+#   The cr-port is deleted during recompute, so hosting-chassis is
+#   removed in the same cycle — no additional feedback recompute.
+#   SB_ha_chassis_group uses noop_handler (write-only table).
+check_recompute_counter 1 1
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 # Delete some of the ports.
@@ -12259,18 +12262,12 @@ check_engine_stats northd norecompute compute
 check_engine_stats lflow norecompute compute
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
-# Adding a logical router port should result in recompute
+# Adding a logical router port (without peer LSP yet) is handled
+# incrementally by the LRP handler.
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
-# for northd engine there will be both recompute and compute
-# first it will be recompute to handle lr0-sw0 and then a compute
-# for the SB port binding change.
-check_engine_stats northd recompute compute
-check_engine_stats lr_nat recompute nocompute
-check_engine_stats lr_stateful recompute nocompute
-check_engine_stats sync_to_sb_pb recompute nocompute
-check_engine_stats sync_to_sb_lb recompute nocompute
-check_engine_stats lflow recompute nocompute
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 check ovn-nbctl lsp-add sw0 sw0-lr0
@@ -12450,25 +12447,17 @@ check_engine_stats sync_to_sb_pb recompute nocompute
 check_engine_stats sync_to_sb_lb norecompute compute
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
-# Create router Policy
+# Create router Policy — handled incrementally via is_lr_policies_changed()
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-policy-add lr0  10 "ip4.src == 10.0.0.3" reroute 172.168.0.101,172.168.0.102
-check_engine_stats northd recompute nocompute
-check_engine_stats lr_nat recompute nocompute
-check_engine_stats lr_stateful recompute nocompute
-check_engine_stats sync_to_sb_pb recompute nocompute
-check_engine_stats sync_to_sb_lb recompute nocompute
-check_engine_stats lflow recompute nocompute
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lr-policy-del lr0  10 "ip4.src == 10.0.0.3"
-check_engine_stats northd recompute nocompute
-check_engine_stats lr_nat recompute nocompute
-check_engine_stats lr_stateful recompute nocompute
-check_engine_stats sync_to_sb_pb recompute nocompute
-check_engine_stats sync_to_sb_lb recompute nocompute
-check_engine_stats lflow recompute nocompute
+check_engine_stats northd norecompute compute
+check_engine_stats lflow norecompute compute
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 OVN_CLEANUP([hv1])
@@ -13862,9 +13851,9 @@ check ovn-nbctl --wait=sb lrp-add lr0 rp0 00:00:00:00:00:01 10.0.0.1/24
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 check ovn-nbctl --wait=sb lrp-del rp0
 
-# LRP handler deletes port + SB binding incrementally, with
-# per-LRP lflow tracking via lflow_ref_resync_flows().
-check_engine_stats northd norecompute compute
+# Standalone LRP deletion falls back to recompute because some
+# per-port flows are generated under od->route_lflow_ref.
+check_engine_stats northd recompute compute
 check_row_count Port_Binding 0
 
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
