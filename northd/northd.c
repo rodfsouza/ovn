@@ -1012,6 +1012,11 @@ ods_append_datapath(struct ovn_datapaths *datapaths, struct ovn_datapath *od)
                                 n * sizeof *datapaths->array);
     datapaths->n_array_alloc = n;
     datapaths->n_mutations++;
+    /* Note: od->index = n - 1 may collide with an existing slot if
+     * a deletion created a gap earlier in the same engine cycle.
+     * This is acceptable because NORTHD_TRACKED_LR_DELETED forces
+     * all downstream handlers to recompute, which rebuilds the
+     * array with proper sequential indices. */
     od->index = n - 1;
     datapaths->array[od->index] = od;
     od->datapaths = datapaths;
@@ -1062,6 +1067,41 @@ lrp_to_lr_map_clear(struct hmap *map)
     struct lrp_lr_map_entry *entry;
     HMAP_FOR_EACH_POP (entry, hmap_node, map) {
         free(entry);
+    }
+}
+
+/* route_to_lr_map: Maps static route → parent router for O(1) lookup. */
+static void
+route_to_lr_map_add(struct hmap *map,
+                    const struct nbrec_logical_router_static_route *route,
+                    struct ovn_datapath *od)
+{
+    struct route_lr_map_entry *e = xmalloc(sizeof *e);
+    e->route = route;
+    e->od = od;
+    hmap_insert(map, &e->hmap_node, hash_pointer(route, 0));
+}
+
+static void
+route_to_lr_map_remove(struct hmap *map,
+                       const struct nbrec_logical_router_static_route *route)
+{
+    struct route_lr_map_entry *e;
+    HMAP_FOR_EACH_WITH_HASH (e, hmap_node, hash_pointer(route, 0), map) {
+        if (e->route == route) {
+            hmap_remove(map, &e->hmap_node);
+            free(e);
+            return;
+        }
+    }
+}
+
+static void
+route_to_lr_map_clear(struct hmap *map)
+{
+    struct route_lr_map_entry *e;
+    HMAP_FOR_EACH_POP (e, hmap_node, map) {
+        free(e);
     }
 }
 
@@ -4989,8 +5029,8 @@ lr_changes_can_be_handled(const struct nbrec_logical_router *lr)
             if (col == NBREC_LOGICAL_ROUTER_COL_LOAD_BALANCER
                 || col == NBREC_LOGICAL_ROUTER_COL_LOAD_BALANCER_GROUP
                 || col == NBREC_LOGICAL_ROUTER_COL_NAT
-                || col == NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES
                 || col == NBREC_LOGICAL_ROUTER_COL_POLICIES
+                || col == NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES
                 || col == NBREC_LOGICAL_ROUTER_COL_PORTS) {
                 continue;
             }
@@ -5026,10 +5066,11 @@ is_lr_nats_seqno_changed(const struct nbrec_logical_router *nbr)
 
 static bool
 is_lr_nats_changed(const struct nbrec_logical_router *nbr) {
+    /* Note: OPTIONS changes are not listed here because they are not
+     * in lr_changes_can_be_handled()'s allowed columns — any OPTIONS
+     * change triggers a full recompute before this is reached. */
     return (nbrec_logical_router_is_updated(nbr,
                                             NBREC_LOGICAL_ROUTER_COL_NAT)
-            || nbrec_logical_router_is_updated(
-                nbr, NBREC_LOGICAL_ROUTER_COL_OPTIONS)
             || is_lr_nats_seqno_changed(nbr));
 }
 
@@ -5110,6 +5151,14 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 }
             }
 
+            /* If NB Static_MAC_Bindings exist, fall back to recompute.
+             * The sync only runs in ovnnb_db_run() (build_static_mac_
+             * binding_table) and has no incremental path. */
+            if (nbrec_static_mac_binding_table_first(
+                    ni->nbrec_static_mac_binding_table)) {
+                goto fail;
+            }
+
             /* Verify not already in lr_datapaths. */
             if (ovn_datapath_find_(&nd->lr_datapaths.datapaths,
                                    &changed_lr->header_.uuid)) {
@@ -5168,8 +5217,10 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 goto fail;
             }
 
-            /* Insert SB datapath_binding record. */
+            /* Insert SB datapath_binding record.  Mark as inserted so
+             * the SB feedback handler knows the pointer is stale. */
             od->sb = sbrec_datapath_binding_insert(ovnsb_idl_txn);
+            od->sb_was_inserted = true;
             ovn_datapath_update_external_ids(od);
             sbrec_datapath_binding_set_tunnel_key(od->sb,
                                                   od->tunnel_key);
@@ -5263,9 +5314,13 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 hmapx_add(&nd->trk_data.trk_nat_lrs, od);
             }
 
-            /* Track routes if present. */
+            /* Track routes if present and populate route map. */
             if (changed_lr->n_static_routes > 0) {
                 hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
+                for (size_t i = 0; i < changed_lr->n_static_routes; i++) {
+                    route_to_lr_map_add(&nd->route_to_lr_map,
+                                        changed_lr->static_routes[i], od);
+                }
             }
 
             /* Track policies if present. */
@@ -5330,6 +5385,12 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             /* Multi-router groups require recursive rebuild. */
             if (od->lr_group && od->lr_group->n_router_dps > 1) {
                 goto fail;
+            }
+
+            /* Remove routes from route_to_lr_map. */
+            for (size_t i = 0; i < od->nbr->n_static_routes; i++) {
+                route_to_lr_map_remove(&nd->route_to_lr_map,
+                                       od->nbr->static_routes[i]);
             }
 
             /* Delete all ports on this router. */
@@ -5426,7 +5487,12 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             /* Destroy the datapath (removes from lr_datapaths hmap). */
             ovn_datapath_destroy(&nd->lr_datapaths.datapaths, od);
 
-            /* Track deletion for downstream handlers. */
+            /* Signal downstream handlers to recompute.
+             * Note: we do NOT populate trk_deleted_lrs because od
+             * is destroyed above.  NORTHD_TRACKED_LR_DELETED is a
+             * recompute-only flag — all downstream consumers
+             * (lr_nat, lr_stateful, lflow) immediately return false
+             * when they see it. */
             nd->trk_data.type |= NORTHD_TRACKED_LR_DELETED;
             continue;
         }
@@ -5447,10 +5513,18 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 &changed_lr->header_.uuid);
             if (od) {
                 for (size_t i = 0; i < changed_lr->n_ports; i++) {
-                    if (!lrp_to_lr_map_find(&nd->lrp_to_lr_map,
-                                             changed_lr->ports[i])) {
+                    struct ovn_datapath *existing_od =
+                        lrp_to_lr_map_find(&nd->lrp_to_lr_map,
+                                           changed_lr->ports[i]);
+                    if (!existing_od) {
                         lrp_to_lr_map_add(&nd->lrp_to_lr_map,
                                           changed_lr->ports[i], od);
+                    } else if (existing_od != od) {
+                        static struct vlog_rate_limit rl
+                            = VLOG_RATE_LIMIT_INIT(5, 1);
+                        VLOG_WARN_RL(&rl,
+                                     "duplicate logical router port %s",
+                                     changed_lr->ports[i]->name);
                     }
                 }
             }
@@ -5479,6 +5553,34 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
             if (!od) {
                 goto fail;
             }
+
+            /* If any route uses BFD, fall back to recompute so
+             * build_bfd_table() runs. */
+            for (size_t i = 0; i < changed_lr->n_static_routes; i++) {
+                if (changed_lr->static_routes[i]->bfd) {
+                    goto fail;
+                }
+            }
+
+            /* Update route_to_lr_map for add/remove.
+             * O(total_routes) scan to find entries for this od.
+             * Acceptable because route column changes are infrequent.
+             * TODO: per-router route list for O(routes_on_router). */
+            if (nbrec_logical_router_is_updated(changed_lr,
+                    NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES)) {
+                struct route_lr_map_entry *e;
+                HMAP_FOR_EACH_SAFE (e, hmap_node, &nd->route_to_lr_map) {
+                    if (e->od == od) {
+                        hmap_remove(&nd->route_to_lr_map, &e->hmap_node);
+                        free(e);
+                    }
+                }
+                for (size_t i = 0; i < changed_lr->n_static_routes; i++) {
+                    route_to_lr_map_add(&nd->route_to_lr_map,
+                                        changed_lr->static_routes[i], od);
+                }
+            }
+
             hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
         }
 
@@ -5606,12 +5708,11 @@ northd_handle_lrp_changes(
                 }
             }
             if (peer) {
-                op->peer = peer;
-                peer->peer = op;
-                /* Mark peer LSP as updated so its flows referencing
-                 * the new peer LRP get regenerated. */
-                hmapx_add(&nd->trk_data.trk_lsps.updated, peer);
-                nd->trk_data.type |= NORTHD_TRACKED_PORTS;
+                /* Peer LSP already exists.  Full peering setup requires
+                 * router_ports, ls_peer, lsp_addrs, mcast relay, and
+                 * arp_proxy — too complex for incremental path today.
+                 * Fall back to recompute. */
+                return false;
             }
 
             hmapx_add(&nd->trk_data.trk_lrps.created, op);
@@ -5624,66 +5725,24 @@ northd_handle_lrp_changes(
             }
 
         } else if (nbrec_logical_router_port_is_deleted(changed_lrp)) {
-            struct ovn_port *op = ovn_port_find(
-                &nd->lr_ports, changed_lrp->name);
-            if (!op) {
+            /* If the port was already removed from lr_ports by the LR
+             * deletion handler, skip it — the LR handler took care of
+             * everything including SB cleanup. */
+            if (!ovn_port_find(&nd->lr_ports, changed_lrp->name)) {
                 continue;
             }
-
-            /* Reject DGW ports (have cr_port). */
-            if (op->cr_port) {
-                return false;
-            }
-
-            /* Delete SB port_binding. */
-            if (op->sb) {
-                sbrec_port_binding_delete(op->sb);
-            }
-
-            /* Disconnect peer and mark for flow update. */
-            if (op->peer) {
-                /* Remove peer from parent switch's router_ports array.
-                 * O(P) where P = router ports on the switch (typically
-                 * 1-5). */
-                struct ovn_datapath *peer_od = op->peer->od;
-                if (peer_od) {
-                    for (size_t j = 0; j < peer_od->n_router_ports; j++) {
-                        if (peer_od->router_ports[j] == op->peer) {
-                            peer_od->router_ports[j] =
-                                peer_od->router_ports[
-                                    --peer_od->n_router_ports];
-                            break;
-                        }
-                    }
-                }
-
-                op->peer->peer = NULL;
-                hmapx_add(&nd->trk_data.trk_lsps.updated, op->peer);
-                nd->trk_data.type |= NORTHD_TRACKED_PORTS;
-            }
-
-            /* Remove from operational hmaps but keep alive for lflow
-             * cleanup.  Do NOT call lflow_ref_clear — the lflow handler
-             * needs the refs intact for lflow_ref_resync_flows().
-             * Port is destroyed in destroy_northd_data_tracked_changes.
-             *
-             * Note: op->od still references the parent datapath.  If
-             * the router is also deleted in this cycle, the LR handler
-             * sets NORTHD_TRACKED_LR_DELETED which causes the lflow
-             * handler to return false (full recompute) BEFORE processing
-             * the LRP tracked data, so op->od is never dereferenced
-             * on a freed datapath. */
-            hmap_remove(&nd->lr_ports, &op->key_node);
-            hmap_remove(&op->od->ports, &op->dp_node);
-
-            hmapx_add(&nd->trk_data.trk_lrps.deleted, op);
-            nd->trk_data.type |= NORTHD_TRACKED_LR_PORTS;
-
-            /* Remove from LRP-to-LR map. */
-            lrp_to_lr_map_remove(&nd->lrp_to_lr_map, changed_lrp);
+            /* Standalone LRP deletion requires full recompute because
+             * some per-port flows (e.g. route_table lflows) are
+             * generated under od->route_lflow_ref rather than
+             * op->lflow_ref, so per-port cleanup can't reach them. */
+            return false;
 
         } else {
-            /* Modified LRP — fall back to recompute. */
+            /* Modified LRP — fall back to recompute.
+             * Status-column changes (hosting-chassis from sync_from_sb)
+             * are safe because nbrec_*_update_status_setkey() is a no-op
+             * when the value already matches, so the feedback loop
+             * self-terminates. */
             return false;
         }
     }
@@ -5699,14 +5758,40 @@ northd_handle_sb_datapath_binding_changes(
 {
     const struct sbrec_datapath_binding *dp;
     SBREC_DATAPATH_BINDING_TABLE_FOR_EACH_TRACKED (dp, sbrec_dp_table) {
+        bool dp_new = sbrec_datapath_binding_is_new(dp);
+        bool dp_del = sbrec_datapath_binding_is_deleted(dp);
+
         /* New + Deleted is a no-op. */
-        if (sbrec_datapath_binding_is_new(dp)
-            && sbrec_datapath_binding_is_deleted(dp)) {
+        if (dp_new && dp_del) {
             continue;
         }
 
-        if (sbrec_datapath_binding_is_deleted(dp)) {
-            return false;
+        if (dp_del) {
+            /* Most likely deleted by northd itself. Look up the od
+             * and only fall back to recompute if the od still exists
+             * with this sb (meaning something external deleted it).
+             *
+             * Note: OVSDB IDL preserves the last-known column values
+             * for tracked deleted rows within the current tracking
+             * epoch, so reading external_ids here is safe. */
+            struct uuid del_uuid;
+            const char *del_s = smap_get(&dp->external_ids,
+                                          "logical-router");
+            if (!del_s) {
+                del_s = smap_get(&dp->external_ids, "logical-switch");
+            }
+            if (del_s && uuid_from_string(&del_uuid, del_s)) {
+                struct ovn_datapath *del_od = ovn_datapath_find_(
+                    &lr_datapaths->datapaths, &del_uuid);
+                if (!del_od) {
+                    del_od = ovn_datapath_find_(
+                        &ls_datapaths->datapaths, &del_uuid);
+                }
+                if (del_od && del_od->sb == dp) {
+                    return false;
+                }
+            }
+            continue;
         }
 
         /* Look up matching ovn_datapath via the NB UUID in external_ids.
@@ -5728,6 +5813,19 @@ northd_handle_sb_datapath_binding_changes(
         }
         if (!od) {
             return false;
+        }
+
+        if (sbrec_datapath_binding_is_new(dp) && od->sb) {
+            if (od->sb_was_inserted) {
+                /* Feedback from our own insert — stale pointer.
+                 * Just update to the real IDL pointer. */
+                od->sb_was_inserted = false;
+            } else {
+                /* od->sb was set by build_datapaths() and is stable.
+                 * A new SB row for the same NB UUID is a genuine
+                 * duplicate — recompute for cleanup. */
+                return false;
+            }
         }
 
         od->sb = dp;
@@ -14854,7 +14952,7 @@ build_lrouter_network_id_flows_for_lrp(
         /* op->lrp_networks.ipv6_addrs will always have LLA and that will be
          * last in the list. So add the flows only if n_ipv6_addrs > 1, and
          * loop n_ipv6_addrs - 1 times. */
-        for (size_t i = 0; i < op->lrp_networks.n_ipv6_addrs - 1; i++) {
+        for (size_t i = 0; i + 1 < op->lrp_networks.n_ipv6_addrs; i++) {
             if (i > OVN_MAX_NETWORK_ID) {
                 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
                 VLOG_WARN_RL(&rl, "Logical router port %s already has the max "
@@ -18980,6 +19078,7 @@ northd_init(struct northd_data *data)
     hmap_init(&data->lb_datapaths_map);
     hmap_init(&data->lb_group_datapaths_map);
     hmap_init(&data->lrp_to_lr_map);
+    hmap_init(&data->route_to_lr_map);
     ovs_list_init(&data->lr_list);
     sset_init(&data->svc_monitor_lsps);
     hmap_init(&data->svc_monitor_map);
@@ -19019,6 +19118,9 @@ northd_destroy(struct northd_data *data)
 
     lrp_to_lr_map_clear(&data->lrp_to_lr_map);
     hmap_destroy(&data->lrp_to_lr_map);
+
+    route_to_lr_map_clear(&data->route_to_lr_map);
+    hmap_destroy(&data->route_to_lr_map);
 
     destroy_datapaths_and_ports(&data->ls_datapaths, &data->lr_datapaths,
                                 &data->ls_ports, &data->lr_ports,
@@ -19073,6 +19175,17 @@ ovnnb_db_run(struct northd_input *input_data,
             for (size_t i = 0; i < lr_od->nbr->n_ports; i++) {
                 lrp_to_lr_map_add(&data->lrp_to_lr_map,
                                   lr_od->nbr->ports[i], lr_od);
+            }
+        }
+    }
+
+    /* Populate route → router map for O(1) parent lookup in handlers. */
+    route_to_lr_map_clear(&data->route_to_lr_map);
+    HMAP_FOR_EACH (lr_od, key_node, &data->lr_datapaths.datapaths) {
+        if (lr_od->nbr) {
+            for (size_t i = 0; i < lr_od->nbr->n_static_routes; i++) {
+                route_to_lr_map_add(&data->route_to_lr_map,
+                                    lr_od->nbr->static_routes[i], lr_od);
             }
         }
     }

@@ -190,9 +190,11 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_northd, &en_sb_meter, NULL);
     engine_add_input(&en_northd, &en_sb_datapath_binding,
                      northd_sb_datapath_binding_handler);
-    engine_add_input(&en_northd, &en_sb_dns, NULL);
-    engine_add_input(&en_northd, &en_sb_ha_chassis_group, NULL);
-    engine_add_input(&en_northd, &en_sb_ip_multicast, NULL);
+    engine_add_input(&en_northd, &en_sb_dns, engine_noop_handler);
+    engine_add_input(&en_northd, &en_sb_ha_chassis_group,
+                     engine_noop_handler);
+    engine_add_input(&en_northd, &en_sb_ip_multicast,
+                     engine_noop_handler);
     engine_add_input(&en_northd, &en_sb_service_monitor, NULL);
     engine_add_input(&en_northd, &en_sb_fdb, NULL);
     engine_add_input(&en_northd, &en_sb_static_mac_binding, NULL);
@@ -225,10 +227,15 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_northd, &en_nb_logical_router_port,
                      northd_nb_logical_router_port_handler);
     engine_add_input(&en_northd, &en_nb_logical_router_static_route,
-                     engine_noop_handler);
+                     northd_nb_static_route_handler);
+    /* Policy and NAT sub-table changes are fully handled by the LR
+     * handler via is_lr_policies_changed() / is_lr_nats_changed(),
+     * which detect both column changes and referenced row seqno
+     * changes.  Use noop_handler to acknowledge without recompute. */
     engine_add_input(&en_northd, &en_nb_logical_router_policy,
                      engine_noop_handler);
-    engine_add_input(&en_northd, &en_nb_nat, engine_noop_handler);
+    engine_add_input(&en_northd, &en_nb_nat,
+                     engine_noop_handler);
 
     engine_add_input(&en_northd, &en_lb_data, northd_lb_data_handler);
 

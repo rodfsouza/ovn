@@ -206,6 +206,26 @@ struct lrp_lr_map_entry {
     struct ovn_datapath *od;
 };
 
+/* Maps nbrec_logical_router_static_route → parent ovn_datapath for O(1). */
+struct route_lr_map_entry {
+    struct hmap_node hmap_node;
+    const struct nbrec_logical_router_static_route *route;
+    struct ovn_datapath *od;
+};
+
+static inline struct ovn_datapath *
+route_to_lr_map_find(const struct hmap *map,
+                     const struct nbrec_logical_router_static_route *route)
+{
+    struct route_lr_map_entry *e;
+    HMAP_FOR_EACH_WITH_HASH (e, hmap_node, hash_pointer(route, 0), map) {
+        if (e->route == route) {
+            return e->od;
+        }
+    }
+    return NULL;
+}
+
 struct northd_data {
     /* Global state for 'en-northd'. */
     struct ovn_datapaths ls_datapaths;
@@ -218,6 +238,7 @@ struct northd_data {
     struct sset svc_monitor_lsps;
     struct hmap svc_monitor_map;
     struct hmap lrp_to_lr_map;  /* struct lrp_lr_map_entry, by LRP ptr */
+    struct hmap route_to_lr_map; /* struct route_lr_map_entry, by route ptr */
 
     /* Change tracking data. */
     struct northd_tracked_data trk_data;
@@ -347,6 +368,8 @@ struct ovn_datapath {
     const struct nbrec_logical_switch *nbs;  /* May be NULL. */
     const struct nbrec_logical_router *nbr;  /* May be NULL. */
     const struct sbrec_datapath_binding *sb; /* May be NULL. */
+    bool sb_was_inserted; /* True when sb was set via insert (stale
+                           * pointer until SB feedback updates it). */
 
     struct ovs_list list;       /* In list of similar records. */
 

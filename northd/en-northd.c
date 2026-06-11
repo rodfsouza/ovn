@@ -242,6 +242,49 @@ northd_nb_logical_router_port_handler(struct engine_node *node,
 }
 
 bool
+northd_nb_static_route_handler(struct engine_node *node, void *data)
+{
+    struct northd_data *nd = data;
+
+    const struct nbrec_logical_router_static_route_table *table =
+        EN_OVSDB_GET(engine_get_input(
+            "NB_logical_router_static_route", node));
+
+    const struct nbrec_logical_router_static_route *route;
+    NBREC_LOGICAL_ROUTER_STATIC_ROUTE_TABLE_FOR_EACH_TRACKED(
+            route, table) {
+
+        /* New/deleted routes: parent LR's static_routes column
+         * also changes → LR handler processes these. */
+        if (nbrec_logical_router_static_route_is_new(route)
+            || nbrec_logical_router_static_route_is_deleted(route)) {
+            continue;
+        }
+
+        /* Row modification. If BFD is involved, recompute. */
+        if (route->bfd
+            || nbrec_logical_router_static_route_is_updated(route,
+                   NBREC_LOGICAL_ROUTER_STATIC_ROUTE_COL_BFD)) {
+            return false;
+        }
+
+        /* Non-BFD modification: find parent router via index. */
+        struct ovn_datapath *od =
+            route_to_lr_map_find(&nd->route_to_lr_map, route);
+        if (!od) {
+            return false;
+        }
+
+        hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
+    }
+
+    if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_routes)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES;
+    }
+    return true;
+}
+
+bool
 northd_lb_data_handler(struct engine_node *node, void *data)
 {
     struct ed_type_lb_data *lb_data = engine_get_input_data("lb_data", node);
