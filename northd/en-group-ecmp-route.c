@@ -17,6 +17,7 @@
 #include "en-group-ecmp-route.h"
 #include "lib/inc-proc-eng.h"
 #include "northd.h"
+#include "simap.h"
 #include "openvswitch/vlog.h"
 #include "stopwatch.h"
 #include "lib/stopwatch-names.h"
