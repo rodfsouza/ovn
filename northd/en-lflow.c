@@ -25,8 +25,7 @@
 #include "en-ls-stateful.h"
 #include "en-northd.h"
 #include "lflow-mgr.h"
-
-struct sync_meters_data;
+#include "en-meters.h"
 
 #include "lib/inc-proc-eng.h"
 #include "northd.h"
