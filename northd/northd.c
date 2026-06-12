@@ -13805,7 +13805,7 @@ build_ND_RA_flows_for_lrouter(struct ovn_datapath *od,
 
 /* Logical router ingress table IP_ROUTING_PRE:
  * by default goto next. (priority 0). */
-static void
+void
 build_ip_routing_pre_flows_for_lrouter(struct ovn_datapath *od,
                                        struct lflow_table *lflows,
                                        struct lflow_ref *lflow_ref)

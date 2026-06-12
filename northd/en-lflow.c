@@ -187,30 +187,10 @@ lflow_northd_handler(struct engine_node *node,
         }
     }
 
-    /* Route changes are handled by lflow_group_ecmp_route_handler.
-     * Here we only rebuild the skeleton flows (default drops, ecmp
-     * bypass, route_table lflows) on od->route_lflow_ref. */
-    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES) {
-        struct hmapx_node *hmapx_node;
-        HMAPX_FOR_EACH (hmapx_node,
-                        &northd_data->trk_data.lr_with_changed_routes) {
-            struct ovn_datapath *od = hmapx_node->data;
-
-            lflow_ref_unlink_lflows(od->route_lflow_ref);
-            build_lr_route_flows_for_datapath(od, &lflow_input,
-                                              lflow_data->lflow_table);
-            if (!lflow_ref_sync_lflows(
-                    od->route_lflow_ref, lflow_data->lflow_table,
-                    eng_ctx->ovnsb_idl_txn,
-                    lflow_input.ls_datapaths,
-                    lflow_input.lr_datapaths,
-                    false,
-                    lflow_input.sbrec_logical_flow_table,
-                    lflow_input.sbrec_logical_dp_group_table)) {
-                return false;
-            }
-        }
-    }
+    /* Per-route flow changes are handled by lflow_group_ecmp_route_handler.
+     * Route skeleton flows (default drops, ecmp bypass, route_table lflows)
+     * on od->route_lflow_ref don't change when routes are added/deleted,
+     * so no action needed here for NORTHD_TRACKED_LR_ROUTES. */
 
     /* Handle routers whose policies changed — rebuild only policy flows. */
     if (northd_data->trk_data.type & NORTHD_TRACKED_LR_POLICIES) {
