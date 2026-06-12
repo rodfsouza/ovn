@@ -19,6 +19,7 @@
 #include <stdio.h>
 
 #include "en-global-config.h"
+#include "en-group-ecmp-route.h"
 #include "en-lflow.h"
 #include "en-lr-nat.h"
 #include "en-lr-stateful.h"
@@ -430,6 +431,74 @@ lflow_ls_stateful_handler(struct engine_node *node, void *data)
                                           &lflow_input,
                                           lflow_data->lflow_table)) {
         return false;
+    }
+
+    engine_set_node_state(node, EN_UPDATED);
+    return true;
+}
+
+bool
+lflow_group_ecmp_route_handler(struct engine_node *node, void *data)
+{
+    struct group_ecmp_route_data *gerd =
+        engine_get_input_data("group_ecmp_route", node);
+
+    if (hmapx_is_empty(&gerd->trk_data.deleted_datapath_routes)
+        && hmapx_is_empty(&gerd->trk_data.crupdated_datapath_routes)) {
+        return true;
+    }
+
+    const struct engine_context *eng_ctx = engine_get_context();
+    struct lflow_data *lflow_data = data;
+    struct lflow_input lflow_input;
+    lflow_get_input_data(node, &lflow_input);
+
+    /* Handle deleted route nodes — unlink and sync to remove SB flows. */
+    struct hmapx_node *hmapx_node;
+    HMAPX_FOR_EACH (hmapx_node, &gerd->trk_data.deleted_datapath_routes) {
+        struct ecmp_route_node *rn = hmapx_node->data;
+        lflow_ref_unlink_lflows(rn->lflow_ref);
+
+        if (!lflow_ref_sync_lflows(
+                rn->lflow_ref, lflow_data->lflow_table,
+                eng_ctx->ovnsb_idl_txn,
+                lflow_input.ls_datapaths,
+                lflow_input.lr_datapaths,
+                false,
+                lflow_input.sbrec_logical_flow_table,
+                lflow_input.sbrec_logical_dp_group_table)) {
+            return false;
+        }
+    }
+
+    /* Handle created/updated route nodes — rebuild and sync flows. */
+    HMAPX_FOR_EACH (hmapx_node, &gerd->trk_data.crupdated_datapath_routes) {
+        struct ecmp_route_node *rn = hmapx_node->data;
+        lflow_ref_unlink_lflows(rn->lflow_ref);
+
+        if (rn->is_ecmp) {
+            build_ecmp_route_flow(lflow_data->lflow_table,
+                                  (struct ovn_datapath *) rn->od,
+                                  lflow_input.features->ct_no_masked_label,
+                                  lflow_input.lr_ports,
+                                  rn->group, rn->lflow_ref);
+        } else {
+            build_static_route_flow(lflow_data->lflow_table,
+                                    (struct ovn_datapath *) rn->od,
+                                    lflow_input.lr_ports,
+                                    rn->route, rn->lflow_ref);
+        }
+
+        if (!lflow_ref_sync_lflows(
+                rn->lflow_ref, lflow_data->lflow_table,
+                eng_ctx->ovnsb_idl_txn,
+                lflow_input.ls_datapaths,
+                lflow_input.lr_datapaths,
+                false,
+                lflow_input.sbrec_logical_flow_table,
+                lflow_input.sbrec_logical_dp_group_table)) {
+            return false;
+        }
     }
 
     engine_set_node_state(node, EN_UPDATED);

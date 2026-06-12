@@ -322,3 +322,135 @@ en_group_ecmp_route_run(struct engine_node *node, void *data_)
 
     engine_set_node_state(node, EN_UPDATED);
 }
+
+bool
+en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
+{
+    struct northd_data *northd_data = engine_get_input_data("northd", node);
+    if (!northd_has_tracked_data(&northd_data->trk_data)) {
+        return false;
+    }
+
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
+        return false;
+    }
+
+    struct group_ecmp_route_data *data = data_;
+
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.lr_with_changed_routes) {
+            struct ovn_datapath *od = hmapx_node->data;
+            struct group_ecmp_datapath *ged =
+                group_ecmp_datapath_lookup(data, od);
+
+            if (ged) {
+                /* Mark old route_nodes as deleted. */
+                struct ecmp_route_node *rn;
+                HMAP_FOR_EACH (rn, hmap_node, &ged->route_nodes) {
+                    hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+                }
+
+                /* Remove old ECMP grouping but keep route_nodes alive
+                 * (the lflow handler needs them to unlink old flows). */
+                ecmp_groups_destroy(&ged->ecmp_groups);
+                hmap_init(&ged->ecmp_groups);
+                unique_routes_destroy(&ged->unique_routes);
+                hmap_init(&ged->unique_routes);
+                parsed_routes_destroy(&ged->parsed_routes);
+                ovs_list_init(&ged->parsed_routes);
+
+                /* Rebuild ECMP groups from current routes. */
+                struct simap route_tables = SIMAP_INITIALIZER(&route_tables);
+                for (int i = 0; i < od->nbr->n_static_routes; i++) {
+                    struct parsed_route *route = parsed_routes_add(
+                        od, &northd_data->lr_ports, &ged->parsed_routes,
+                        &route_tables, od->nbr->static_routes[i], NULL);
+                    if (!route) {
+                        continue;
+                    }
+                    struct ecmp_groups_node *group =
+                        ecmp_groups_find(&ged->ecmp_groups, route);
+                    if (group) {
+                        ecmp_groups_add_route(group, route);
+                    } else {
+                        const struct parsed_route *existed =
+                            unique_routes_remove(&ged->unique_routes, route);
+                        if (existed) {
+                            group = ecmp_groups_add(&ged->ecmp_groups,
+                                                    existed);
+                            if (group) {
+                                ecmp_groups_add_route(group, route);
+                            }
+                        } else if (route->ecmp_symmetric_reply) {
+                            ecmp_groups_add(&ged->ecmp_groups, route);
+                        } else {
+                            unique_routes_add(&ged->unique_routes, route);
+                        }
+                    }
+                }
+                simap_destroy(&route_tables);
+
+                /* Create new route_nodes and mark as crupdated. */
+                struct ecmp_groups_node *eg;
+                HMAP_FOR_EACH (eg, hmap_node, &ged->ecmp_groups) {
+                    rn = xzalloc(sizeof *rn);
+                    rn->od = od;
+                    rn->lflow_ref = lflow_ref_create();
+                    rn->is_ecmp = true;
+                    rn->group = eg;
+                    hmap_insert(&ged->route_nodes, &rn->hmap_node,
+                                uuid_hash(&od->key) ^ eg->id);
+                    hmapx_add(&data->trk_data.crupdated_datapath_routes, rn);
+                }
+                const struct unique_routes_node *ur;
+                HMAP_FOR_EACH (ur, hmap_node, &ged->unique_routes) {
+                    rn = xzalloc(sizeof *rn);
+                    rn->od = od;
+                    rn->lflow_ref = lflow_ref_create();
+                    rn->is_ecmp = false;
+                    rn->route = ur->route;
+                    hmap_insert(&ged->route_nodes, &rn->hmap_node,
+                                uuid_hash(&ur->route->route->header_.uuid));
+                    hmapx_add(&data->trk_data.crupdated_datapath_routes, rn);
+                }
+            } else {
+                /* Router had no routes before, build from scratch. */
+                group_ecmp_route(data, od, &northd_data->lr_ports, NULL);
+                ged = group_ecmp_datapath_lookup(data, od);
+                if (ged) {
+                    struct ecmp_route_node *rn;
+                    HMAP_FOR_EACH (rn, hmap_node, &ged->route_nodes) {
+                        hmapx_add(
+                            &data->trk_data.crupdated_datapath_routes, rn);
+                    }
+                }
+            }
+        }
+        engine_set_node_state(node, EN_UPDATED);
+    }
+
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.trk_created_lrs) {
+            struct ovn_datapath *od = hmapx_node->data;
+            if (od->nbr && od->nbr->n_static_routes > 0) {
+                group_ecmp_route(data, od, &northd_data->lr_ports, NULL);
+                struct group_ecmp_datapath *ged =
+                    group_ecmp_datapath_lookup(data, od);
+                if (ged) {
+                    struct ecmp_route_node *rn;
+                    HMAP_FOR_EACH (rn, hmap_node, &ged->route_nodes) {
+                        hmapx_add(
+                            &data->trk_data.crupdated_datapath_routes, rn);
+                    }
+                }
+            }
+        }
+        engine_set_node_state(node, EN_UPDATED);
+    }
+
+    return true;
+}
