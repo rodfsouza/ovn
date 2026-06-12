@@ -382,6 +382,13 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
 
                 /* Rebuild ECMP groups from current routes. */
                 struct simap route_tables = SIMAP_INITIALIZER(&route_tables);
+                for (int i = 0; i < od->nbr->n_ports; i++) {
+                    const char *rt = smap_get(
+                        &od->nbr->ports[i]->options, "route_table");
+                    if (rt && rt[0]) {
+                        get_route_table_id(&route_tables, rt);
+                    }
+                }
                 for (int i = 0; i < od->nbr->n_static_routes; i++) {
                     struct parsed_route *route = parsed_routes_add(
                         od, &northd_data->lr_ports, &ged->parsed_routes,
@@ -455,7 +462,8 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
         HMAPX_FOR_EACH (hmapx_node,
                         &northd_data->trk_data.trk_created_lrs) {
             struct ovn_datapath *od = hmapx_node->data;
-            if (od->nbr && od->nbr->n_static_routes > 0) {
+            if (od->nbr && od->nbr->n_static_routes > 0
+                && !group_ecmp_datapath_lookup(data, od)) {
                 group_ecmp_route(data, od, &northd_data->lr_ports, NULL);
                 struct group_ecmp_datapath *ged =
                     group_ecmp_datapath_lookup(data, od);

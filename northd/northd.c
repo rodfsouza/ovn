@@ -17228,9 +17228,6 @@ build_lr_route_flows_for_datapath(struct ovn_datapath *od,
                                   struct lflow_input *input_data,
                                   struct lflow_table *lflows)
 {
-    struct ds match = DS_EMPTY_INITIALIZER;
-    struct ds actions = DS_EMPTY_INITIALIZER;
-
     build_ip_routing_pre_flows_for_lrouter(od, lflows,
                                            od->route_lflow_ref);
     build_static_route_flows_for_lrouter(od, input_data->features,
@@ -17239,9 +17236,6 @@ build_lr_route_flows_for_datapath(struct ovn_datapath *od,
                                          input_data->bfd_connections,
                                          input_data->group_ecmp_data,
                                          od->route_lflow_ref);
-
-    ds_destroy(&match);
-    ds_destroy(&actions);
 }
 
 /* Public wrapper to rebuild only policy-specific flows for a single router. */
