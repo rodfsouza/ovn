@@ -15,6 +15,7 @@
 #include <config.h>
 
 #include "en-group-ecmp-route.h"
+#include "lflow-mgr.h"
 #include "lib/inc-proc-eng.h"
 #include "northd.h"
 #include "simap.h"
@@ -159,6 +160,7 @@ group_ecmp_datapath_add(struct group_ecmp_route_data *data,
     hmap_init(&ged->ecmp_groups);
     hmap_init(&ged->unique_routes);
     ovs_list_init(&ged->parsed_routes);
+    hmap_init(&ged->route_nodes);
     hmap_insert(&data->datapaths, &ged->hmap_node,
                 uuid_hash(&od->key));
     return ged;
@@ -184,6 +186,14 @@ group_ecmp_datapath_destroy(struct group_ecmp_datapath *ged)
     ecmp_groups_destroy(&ged->ecmp_groups);
     unique_routes_destroy(&ged->unique_routes);
     parsed_routes_destroy(&ged->parsed_routes);
+
+    struct ecmp_route_node *rn;
+    HMAP_FOR_EACH_POP (rn, hmap_node, &ged->route_nodes) {
+        lflow_ref_destroy(rn->lflow_ref);
+        free(rn);
+    }
+    hmap_destroy(&ged->route_nodes);
+
     free(ged);
 }
 
@@ -239,6 +249,28 @@ group_ecmp_route(struct group_ecmp_route_data *data,
         }
     }
     simap_destroy(&route_tables);
+
+    /* Create per-route/group nodes with independent lflow_refs. */
+    struct ecmp_groups_node *eg;
+    HMAP_FOR_EACH (eg, hmap_node, &ged->ecmp_groups) {
+        struct ecmp_route_node *rn = xzalloc(sizeof *rn);
+        rn->od = od;
+        rn->lflow_ref = lflow_ref_create();
+        rn->is_ecmp = true;
+        rn->group = eg;
+        hmap_insert(&ged->route_nodes, &rn->hmap_node,
+                    uuid_hash(&od->key) ^ eg->id);
+    }
+    const struct unique_routes_node *ur;
+    HMAP_FOR_EACH (ur, hmap_node, &ged->unique_routes) {
+        struct ecmp_route_node *rn = xzalloc(sizeof *rn);
+        rn->od = od;
+        rn->lflow_ref = lflow_ref_create();
+        rn->is_ecmp = false;
+        rn->route = ur->route;
+        hmap_insert(&ged->route_nodes, &rn->hmap_node,
+                    uuid_hash(&ur->route->route->header_.uuid));
+    }
 }
 
 /* Engine node functions. */
@@ -249,6 +281,8 @@ en_group_ecmp_route_init(struct engine_node *node OVS_UNUSED,
 {
     struct group_ecmp_route_data *data = xzalloc(sizeof *data);
     hmap_init(&data->datapaths);
+    hmapx_init(&data->trk_data.deleted_datapath_routes);
+    hmapx_init(&data->trk_data.crupdated_datapath_routes);
     return data;
 }
 
@@ -258,11 +292,16 @@ en_group_ecmp_route_cleanup(void *data_)
     struct group_ecmp_route_data *data = data_;
     group_ecmp_route_clear(data);
     hmap_destroy(&data->datapaths);
+    hmapx_destroy(&data->trk_data.deleted_datapath_routes);
+    hmapx_destroy(&data->trk_data.crupdated_datapath_routes);
 }
 
 void
-en_group_ecmp_route_clear_tracked_data(void *data OVS_UNUSED)
+en_group_ecmp_route_clear_tracked_data(void *data_)
 {
+    struct group_ecmp_route_data *data = data_;
+    hmapx_clear(&data->trk_data.deleted_datapath_routes);
+    hmapx_clear(&data->trk_data.crupdated_datapath_routes);
 }
 
 void

@@ -22,6 +22,7 @@
 #include "openvswitch/list.h"
 #include "include/ovn/expr.h"
 
+struct lflow_ref;
 struct nbrec_logical_router_static_route;
 struct ovn_datapath;
 struct parsed_route;
@@ -50,22 +51,43 @@ struct unique_routes_node {
     const struct parsed_route *route;
 };
 
+/* Per-route/group node with its own lflow_ref for independent
+ * flow tracking.  Enables per-route incremental add/delete. */
+struct ecmp_route_node {
+    struct hmap_node hmap_node;
+    const struct ovn_datapath *od;
+    struct lflow_ref *lflow_ref;
+    bool is_ecmp;
+    union {
+        const struct parsed_route *route;
+        struct ecmp_groups_node *group;
+    };
+};
+
 struct group_ecmp_datapath {
     struct hmap_node hmap_node;
     const struct ovn_datapath *od;
     struct hmap ecmp_groups;
     struct hmap unique_routes;
     struct ovs_list parsed_routes;
+    struct hmap route_nodes;
+};
+
+struct group_ecmp_route_tracked_data {
+    struct hmapx deleted_datapath_routes;
+    struct hmapx crupdated_datapath_routes;
 };
 
 struct group_ecmp_route_data {
     struct hmap datapaths;
+    struct group_ecmp_route_tracked_data trk_data;
 };
 
 void *en_group_ecmp_route_init(struct engine_node *, struct engine_arg *);
 void en_group_ecmp_route_cleanup(void *data);
 void en_group_ecmp_route_clear_tracked_data(void *data);
 void en_group_ecmp_route_run(struct engine_node *, void *data);
+bool en_group_ecmp_route_northd_handler(struct engine_node *, void *data);
 
 struct group_ecmp_datapath *group_ecmp_datapath_lookup(
     const struct group_ecmp_route_data *data,
