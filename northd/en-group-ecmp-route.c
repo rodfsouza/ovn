@@ -381,16 +381,19 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                 group_ecmp_datapath_lookup(data, od);
 
             if (ged) {
-                /* Remove old route_nodes from the hmap and mark as deleted.
-                 * The lflow handler needs them alive to unlink old flows,
-                 * but they must not remain in route_nodes since
-                 * parsed_routes_destroy() below frees the parsed_routes
-                 * they reference. */
+                /* Save old route_nodes for lflow_ref reuse. Remove from
+                 * route_nodes hmap so they don't get iterated by
+                 * build_static_route_flows_for_lrouter if en_lflow_run
+                 * does a full recompute. */
+                struct hmap old_route_nodes = HMAP_INITIALIZER(
+                    &old_route_nodes);
                 struct ecmp_route_node *rn;
                 HMAP_FOR_EACH_SAFE (rn, hmap_node, &ged->route_nodes) {
                     hmap_remove(&ged->route_nodes, &rn->hmap_node);
-                    hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+                    hmap_insert(&old_route_nodes, &rn->hmap_node,
+                                rn->hmap_node.hash);
                 }
+
                 ecmp_groups_destroy(&ged->ecmp_groups);
                 hmap_init(&ged->ecmp_groups);
                 unique_routes_destroy(&ged->unique_routes);
@@ -442,29 +445,60 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                 }
                 simap_destroy(&route_tables);
 
-                /* Create new route_nodes and mark as crupdated. */
+                /* Create new route_nodes. Reuse lflow_refs from old
+                 * route_nodes when the route is unchanged (same UUID
+                 * for unique routes). ECMP groups always get new
+                 * lflow_refs since membership may have changed. */
                 struct ecmp_groups_node *eg;
                 HMAP_FOR_EACH (eg, hmap_node, &ged->ecmp_groups) {
+                    uint32_t hash = uuid_hash(&od->key) ^ eg->id;
                     rn = xzalloc(sizeof *rn);
                     rn->od = od;
-                    rn->lflow_ref = lflow_ref_create();
                     rn->is_ecmp = true;
                     rn->group = eg;
-                    hmap_insert(&ged->route_nodes, &rn->hmap_node,
-                                uuid_hash(&od->key) ^ eg->id);
+                    rn->lflow_ref = lflow_ref_create();
+                    hmap_insert(&ged->route_nodes, &rn->hmap_node, hash);
                     hmapx_add(&data->trk_data.crupdated_datapath_routes, rn);
                 }
                 const struct unique_routes_node *ur;
                 HMAP_FOR_EACH (ur, hmap_node, &ged->unique_routes) {
+                    uint32_t hash = uuid_hash(
+                        &ur->route->route->header_.uuid);
                     rn = xzalloc(sizeof *rn);
                     rn->od = od;
-                    rn->lflow_ref = lflow_ref_create();
                     rn->is_ecmp = false;
                     rn->route = ur->route;
-                    hmap_insert(&ged->route_nodes, &rn->hmap_node,
-                                uuid_hash(&ur->route->route->header_.uuid));
-                    hmapx_add(&data->trk_data.crupdated_datapath_routes, rn);
+
+                    /* Try to reuse lflow_ref from matching old node. */
+                    struct ecmp_route_node *old_rn;
+                    HMAP_FOR_EACH_WITH_HASH (old_rn, hmap_node, hash,
+                                             &old_route_nodes) {
+                        if (!old_rn->is_ecmp && uuid_equals(
+                                &old_rn->route->route->header_.uuid,
+                                &ur->route->route->header_.uuid)) {
+                            break;
+                        }
+                    }
+                    if (old_rn) {
+                        rn->lflow_ref = old_rn->lflow_ref;
+                        old_rn->lflow_ref = NULL;
+                        hmap_remove(&old_route_nodes, &old_rn->hmap_node);
+                        free(old_rn);
+                    } else {
+                        rn->lflow_ref = lflow_ref_create();
+                        hmapx_add(
+                            &data->trk_data.crupdated_datapath_routes, rn);
+                    }
+
+                    hmap_insert(&ged->route_nodes, &rn->hmap_node, hash);
                 }
+
+                /* Remaining old route_nodes are deleted routes. */
+                HMAP_FOR_EACH_SAFE (rn, hmap_node, &old_route_nodes) {
+                    hmap_remove(&old_route_nodes, &rn->hmap_node);
+                    hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+                }
+                hmap_destroy(&old_route_nodes);
             } else {
                 /* Router had no routes before, build from scratch. */
                 group_ecmp_route(data, od, &northd_data->lr_ports, NULL);
