@@ -865,6 +865,7 @@ struct parsed_route *parsed_routes_add(
 void parsed_routes_destroy(struct ovs_list *routes);
 
 /* Route flow generation (used by en-lflow.c). */
+struct ecmp_groups_node;
 void build_ecmp_route_flow(struct lflow_table *lflows,
     struct ovn_datapath *od, bool ct_masked_mark,
     const struct hmap *lr_ports, struct ecmp_groups_node *eg,
