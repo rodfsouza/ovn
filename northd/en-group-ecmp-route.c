@@ -300,6 +300,13 @@ void
 en_group_ecmp_route_clear_tracked_data(void *data_)
 {
     struct group_ecmp_route_data *data = data_;
+
+    struct hmapx_node *node;
+    HMAPX_FOR_EACH_SAFE (node, &data->trk_data.deleted_datapath_routes) {
+        struct ecmp_route_node *rn = node->data;
+        lflow_ref_destroy(rn->lflow_ref);
+        free(rn);
+    }
     hmapx_clear(&data->trk_data.deleted_datapath_routes);
     hmapx_clear(&data->trk_data.crupdated_datapath_routes);
 }
@@ -346,14 +353,16 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                 group_ecmp_datapath_lookup(data, od);
 
             if (ged) {
-                /* Mark old route_nodes as deleted. */
+                /* Remove old route_nodes from the hmap and mark as deleted.
+                 * The lflow handler needs them alive to unlink old flows,
+                 * but they must not remain in route_nodes since
+                 * parsed_routes_destroy() below frees the parsed_routes
+                 * they reference. */
                 struct ecmp_route_node *rn;
-                HMAP_FOR_EACH (rn, hmap_node, &ged->route_nodes) {
+                HMAP_FOR_EACH_SAFE (rn, hmap_node, &ged->route_nodes) {
+                    hmap_remove(&ged->route_nodes, &rn->hmap_node);
                     hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
                 }
-
-                /* Remove old ECMP grouping but keep route_nodes alive
-                 * (the lflow handler needs them to unlink old flows). */
                 ecmp_groups_destroy(&ged->ecmp_groups);
                 hmap_init(&ged->ecmp_groups);
                 unique_routes_destroy(&ged->unique_routes);
