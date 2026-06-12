@@ -187,138 +187,27 @@ lflow_northd_handler(struct engine_node *node,
         }
     }
 
-    /* Handle routers whose static routes changed.
-     * Try per-route incremental first (only for non-ECMP add/delete).
-     * Fall back to per-router rebuild for ECMP-affected changes,
-     * route modifications, or mixed add+delete. */
+    /* Route changes are handled by lflow_group_ecmp_route_handler.
+     * Here we only rebuild the skeleton flows (default drops, ecmp
+     * bypass, route_table lflows) on od->route_lflow_ref. */
     if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES) {
-        bool per_route_ok = true;
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.lr_with_changed_routes) {
+            struct ovn_datapath *od = hmapx_node->data;
 
-        /* Check if all deleted routes are non-ECMP (have per-route refs). */
-        struct route_del_entry *rde;
-        LIST_FOR_EACH (rde, list_node,
-                       &northd_data->trk_data.routes_deleted) {
-            if (!route_flow_ref_find(&rde->od->route_refs,
-                                      &rde->route_uuid)) {
-                per_route_ok = false;
-                break;
-            }
-        }
-
-        /* Check if all added routes are non-ECMP. */
-        if (per_route_ok) {
-            struct hmapx_node *hmapx_node;
-            HMAPX_FOR_EACH (hmapx_node,
-                            &northd_data->trk_data.routes_added) {
-                const struct nbrec_logical_router_static_route *route =
-                    hmapx_node->data;
-                struct ovn_datapath *od = route_to_lr_map_find(
-                    &northd_data->route_to_lr_map, route);
-                if (!od || route_affects_ecmp(od, route,
-                                              &northd_data->lr_ports)) {
-                    per_route_ok = false;
-                    break;
-                }
-            }
-        }
-
-        if (per_route_ok
-            && (!hmapx_is_empty(&northd_data->trk_data.routes_added)
-                || !ovs_list_is_empty(
-                    &northd_data->trk_data.routes_deleted))) {
-            /* Per-route incremental: handle only changed routes. */
-
-            /* Delete flows for removed routes. */
-            LIST_FOR_EACH (rde, list_node,
-                           &northd_data->trk_data.routes_deleted) {
-                struct route_flow_ref *rfr = route_flow_ref_find(
-                    &rde->od->route_refs, &rde->route_uuid);
-                if (rfr) {
-                    if (!lflow_ref_resync_flows(
-                            rfr->lflow_ref, lflow_data->lflow_table,
-                            eng_ctx->ovnsb_idl_txn,
-                            lflow_input.ls_datapaths,
-                            lflow_input.lr_datapaths,
-                            false,
-                            lflow_input.sbrec_logical_flow_table,
-                            lflow_input.sbrec_logical_dp_group_table)) {
-                        return false;
-                    }
-                    route_flow_ref_destroy(&rde->od->route_refs, rfr);
-                }
-            }
-
-            /* Generate flows for added routes. */
-            struct hmapx_node *hmapx_node;
-            HMAPX_FOR_EACH (hmapx_node,
-                            &northd_data->trk_data.routes_added) {
-                const struct nbrec_logical_router_static_route *route =
-                    hmapx_node->data;
-                struct ovn_datapath *od = route_to_lr_map_find(
-                    &northd_data->route_to_lr_map, route);
-                if (!od) {
-                    return false;
-                }
-
-                struct route_flow_ref *rfr = route_flow_ref_create(
-                    &od->route_refs, &route->header_.uuid);
-                build_single_route_flows(od, route,
-                                          lflow_data->lflow_table,
-                                          &northd_data->lr_ports,
-                                          rfr->lflow_ref);
-                if (!lflow_ref_sync_lflows(
-                        rfr->lflow_ref, lflow_data->lflow_table,
-                        eng_ctx->ovnsb_idl_txn,
-                        lflow_input.ls_datapaths,
-                        lflow_input.lr_datapaths,
-                        false,
-                        lflow_input.sbrec_logical_flow_table,
-                        lflow_input.sbrec_logical_dp_group_table)) {
-                    return false;
-                }
-            }
-        } else {
-            /* Fall back to per-router rebuild (ECMP, modifications,
-             * or route seqno changes without column change). */
-            struct hmapx_node *hmapx_node;
-            HMAPX_FOR_EACH (hmapx_node,
-                            &northd_data->trk_data.lr_with_changed_routes) {
-                struct ovn_datapath *od = hmapx_node->data;
-
-                /* Unlink per-route refs. */
-                struct route_flow_ref *rfr;
-                HMAP_FOR_EACH (rfr, hmap_node, &od->route_refs) {
-                    lflow_ref_unlink_lflows(rfr->lflow_ref);
-                }
-                lflow_ref_unlink_lflows(od->route_lflow_ref);
-
-                build_lr_route_flows_for_datapath(od, &lflow_input,
-                                                  lflow_data->lflow_table);
-
-                /* Sync router-level route ref. */
-                if (!lflow_ref_sync_lflows(
-                        od->route_lflow_ref, lflow_data->lflow_table,
-                        eng_ctx->ovnsb_idl_txn,
-                        lflow_input.ls_datapaths,
-                        lflow_input.lr_datapaths,
-                        false,
-                        lflow_input.sbrec_logical_flow_table,
-                        lflow_input.sbrec_logical_dp_group_table)) {
-                    return false;
-                }
-                /* Sync per-route refs. */
-                HMAP_FOR_EACH (rfr, hmap_node, &od->route_refs) {
-                    if (!lflow_ref_sync_lflows(
-                            rfr->lflow_ref, lflow_data->lflow_table,
-                            eng_ctx->ovnsb_idl_txn,
-                            lflow_input.ls_datapaths,
-                            lflow_input.lr_datapaths,
-                            false,
-                            lflow_input.sbrec_logical_flow_table,
-                            lflow_input.sbrec_logical_dp_group_table)) {
-                        return false;
-                    }
-                }
+            lflow_ref_unlink_lflows(od->route_lflow_ref);
+            build_lr_route_flows_for_datapath(od, &lflow_input,
+                                              lflow_data->lflow_table);
+            if (!lflow_ref_sync_lflows(
+                    od->route_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
             }
         }
     }

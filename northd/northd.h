@@ -194,12 +194,6 @@ struct northd_tracked_data {
      * hmapx node data is 'struct ovn_datapath *'. */
     struct hmapx lr_with_changed_routes;
 
-    /* Per-route change tracking for fine-grained incremental.
-     * routes_added: nbrec_logical_router_static_route * (new routes).
-     * routes_deleted: struct route_del_entry * (route UUID + parent od). */
-    struct hmapx routes_added;
-    struct ovs_list routes_deleted;
-
     /* Tracked routers whose policies have changed.
      * hmapx node data is 'struct ovn_datapath *'. */
     struct hmapx lr_with_changed_policies;
@@ -209,21 +203,6 @@ struct northd_tracked_data {
 struct lrp_lr_map_entry {
     struct hmap_node hmap_node;
     const struct nbrec_logical_router_port *lrp;
-    struct ovn_datapath *od;
-};
-
-/* Per-route flow tracking for incremental route add/delete.
- * Stored in od->route_refs hmap, keyed by route UUID. */
-struct route_flow_ref {
-    struct hmap_node hmap_node;
-    struct uuid route_uuid;
-    struct lflow_ref *lflow_ref;
-};
-
-/* Entry for tracking deleted routes (UUID + parent datapath). */
-struct route_del_entry {
-    struct ovs_list list_node;
-    struct uuid route_uuid;
     struct ovn_datapath *od;
 };
 
@@ -460,11 +439,10 @@ struct ovn_datapath {
 
     /* Route-specific lflow tracking — separated so route changes only
      * rebuild routing flows, not all datapath flows.
-     * route_lflow_ref tracks skeleton flows (default drops, ecmp bypass)
-     * and route_table per-LRP flows.
-     * route_refs tracks per-route flows for fine-grained incremental. */
+     * Tracks skeleton flows (default drops, ecmp bypass) and
+     * route_table per-LRP flows. Per-route/group flows are tracked
+     * by ecmp_route_node->lflow_ref in group_ecmp_route_data. */
     struct lflow_ref *route_lflow_ref;
-    struct hmap route_refs;
 
     /* Policy-specific lflow tracking — separated for the same reason. */
     struct lflow_ref *policy_lflow_ref;
@@ -873,21 +851,6 @@ void build_ecmp_route_flow(struct lflow_table *lflows,
 void build_static_route_flow(struct lflow_table *lflows,
     struct ovn_datapath *od, const struct hmap *lr_ports,
     const struct parsed_route *route_, struct lflow_ref *lflow_ref);
-
-/* Per-route flow ref helpers (used by en-lflow.c). */
-struct route_flow_ref *route_flow_ref_find(const struct hmap *route_refs,
-                                           const struct uuid *uuid);
-struct route_flow_ref *route_flow_ref_create(struct hmap *route_refs,
-                                             const struct uuid *uuid);
-void route_flow_ref_destroy(struct hmap *route_refs,
-                            struct route_flow_ref *rfr);
-void build_single_route_flows(struct ovn_datapath *od,
-    const struct nbrec_logical_router_static_route *route,
-    struct lflow_table *lflows, const struct hmap *lr_ports,
-    struct lflow_ref *per_route_ref);
-bool route_affects_ecmp(const struct ovn_datapath *od,
-    const struct nbrec_logical_router_static_route *route,
-    const struct hmap *lr_ports);
 
 bool lflow_handle_lr_stateful_changes(struct ovsdb_idl_txn *,
                                       struct lr_stateful_tracked_data *,
