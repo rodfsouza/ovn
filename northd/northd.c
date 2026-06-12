@@ -14695,13 +14695,14 @@ build_lr_gateway_redirect_flows_for_nats(
  * In the common case where the Ethernet destination has been resolved,
  * this table outputs the packet (priority 0).  Otherwise, it composes
  * and sends an ARP/IPv6 NA request (priority 100). */
-static void
+void
 build_arp_request_flows_for_lrouter(
-        struct ovn_datapath *od, struct lflow_table *lflows,
-        struct ds *match, struct ds *actions,
+        const struct ovn_datapath *od, struct lflow_table *lflows,
         const struct shash *meter_groups,
         struct lflow_ref *lflow_ref)
 {
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
     ovs_assert(od->nbr);
     for (int i = 0; i < od->nbr->n_static_routes; i++) {
         const struct nbrec_logical_router_static_route *route;
@@ -14715,8 +14716,8 @@ build_arp_request_flows_for_lrouter(
             continue;
         }
 
-        ds_clear(match);
-        ds_put_format(match, "eth.dst == 00:00:00:00:00:00 && "
+        ds_clear(&match);
+        ds_put_format(&match, "eth.dst == 00:00:00:00:00:00 && "
                       "ip6 && " REG_NEXT_HOP_IPV6 " == %s",
                       route->nexthop);
         struct in6_addr sn_addr;
@@ -14727,8 +14728,8 @@ build_arp_request_flows_for_lrouter(
         char sn_addr_s[INET6_ADDRSTRLEN + 1];
         ipv6_string_mapped(sn_addr_s, &sn_addr);
 
-        ds_clear(actions);
-        ds_put_format(actions,
+        ds_clear(&actions);
+        ds_put_format(&actions,
                       "nd_ns { "
                       "eth.dst = "ETH_ADDR_FMT"; "
                       "ip6.dst = %s; "
@@ -14738,7 +14739,7 @@ build_arp_request_flows_for_lrouter(
                       route->nexthop);
 
         ovn_lflow_add_with_hint__(lflows, od, S_ROUTER_IN_ARP_REQUEST, 200,
-                                  ds_cstr(match), ds_cstr(actions), NULL,
+                                  ds_cstr(&match), ds_cstr(&actions), NULL,
                                   copp_meter_get(COPP_ND_NS_RESOLVE,
                                                  od->nbr->copp,
                                                  meter_groups),
@@ -14769,6 +14770,8 @@ build_arp_request_flows_for_lrouter(
                       lflow_ref);
     ovn_lflow_add(lflows, od, S_ROUTER_IN_ARP_REQUEST, 0, "1", "output;",
                   lflow_ref);
+    ds_destroy(&match);
+    ds_destroy(&actions);
 }
 
 static void
@@ -17156,8 +17159,7 @@ build_lswitch_and_lrouter_iterate_by_lr(struct ovn_datapath *od,
                                           lsi->features);
     build_gateway_redirect_flows_for_lrouter(od, lsi->lflows, &lsi->match,
                                              &lsi->actions, od->lflow_ref);
-    build_arp_request_flows_for_lrouter(od, lsi->lflows, &lsi->match,
-                                        &lsi->actions,
+    build_arp_request_flows_for_lrouter(od, lsi->lflows,
                                         lsi->meter_groups,
                                         od->lflow_ref);
     build_lrouter_network_id_flows(od, lsi->lflows, &lsi->match,

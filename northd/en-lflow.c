@@ -364,6 +364,11 @@ lflow_group_ecmp_route_handler(struct engine_node *node, void *data)
                                     rn->route, rn->lflow_ref);
         }
 
+        build_arp_request_flows_for_lrouter(rn->od,
+                                            lflow_data->lflow_table,
+                                            lflow_input.meter_groups,
+                                            rn->lflow_ref);
+
         if (!lflow_ref_sync_lflows(
                 rn->lflow_ref, lflow_data->lflow_table,
                 eng_ctx->ovnsb_idl_txn,

@@ -857,6 +857,9 @@ void build_ecmp_route_flow(struct lflow_table *lflows,
 void build_static_route_flow(struct lflow_table *lflows,
     struct ovn_datapath *od, const struct hmap *lr_ports,
     const struct parsed_route *route_, struct lflow_ref *lflow_ref);
+void build_arp_request_flows_for_lrouter(
+    const struct ovn_datapath *od, struct lflow_table *lflows,
+    const struct shash *meter_groups, struct lflow_ref *lflow_ref);
 
 bool lflow_handle_lr_stateful_changes(struct ovsdb_idl_txn *,
                                       struct lr_stateful_tracked_data *,
