@@ -81,6 +81,10 @@ lflow_get_input_data(struct engine_node *node,
     lflow_input->svc_monitor_map = &northd_data->svc_monitor_map;
     lflow_input->bfd_connections = NULL;
 
+    struct group_ecmp_route_data *gerd =
+        engine_get_input_data("group_ecmp_route", node);
+    lflow_input->group_ecmp_data = gerd;
+
     struct ed_type_global_config *global_config =
         engine_get_input_data("global_config", node);
     lflow_input->features = &global_config->features;

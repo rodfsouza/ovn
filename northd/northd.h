@@ -293,6 +293,7 @@ struct lflow_input {
     const struct hmap *bfd_connections;
     const struct chassis_features *features;
     const struct hmap *svc_monitor_map;
+    const struct group_ecmp_route_data *group_ecmp_data;
     bool ovn_internal_version_changed;
     const char *svc_monitor_mac;
 };
