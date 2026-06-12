@@ -17172,6 +17172,7 @@ build_lr_flows_for_datapath(struct ovn_datapath *od,
         .svc_monitor_map = input_data->svc_monitor_map,
         .bfd_connections = input_data->bfd_connections,
         .features = input_data->features,
+        .group_ecmp_data = input_data->group_ecmp_data,
     };
     ds_init(&lsi.match);
     ds_init(&lsi.actions);
