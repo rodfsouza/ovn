@@ -817,6 +817,7 @@ bool lflow_handle_northd_lb_changes(struct ovsdb_idl_txn *ovnsb_txn,
 /* Parsed static route — used by northd.c and en-group-ecmp-route.c. */
 struct parsed_route {
     struct ovs_list list_node;
+    struct hmap_node key_node;  /* In group_ecmp_datapath.parsed_routes_by_uuid */
     struct in6_addr prefix;
     unsigned int plen;
     bool is_src_route;
@@ -825,6 +826,7 @@ struct parsed_route {
     const struct nbrec_logical_router_static_route *route;
     bool ecmp_symmetric_reply;
     bool is_discard_route;
+    bool stale;
 };
 
 static inline uint32_t

@@ -70,6 +70,7 @@ struct group_ecmp_datapath {
     struct hmap ecmp_groups;
     struct hmap unique_routes;
     struct ovs_list parsed_routes;
+    struct hmap parsed_routes_by_uuid;
     struct hmap route_nodes;
 };
 
@@ -92,6 +93,10 @@ bool en_group_ecmp_route_northd_handler(struct engine_node *, void *data);
 struct group_ecmp_datapath *group_ecmp_datapath_lookup(
     const struct group_ecmp_route_data *data,
     const struct ovn_datapath *od);
+
+struct parsed_route *parsed_route_lookup_by_uuid(
+    const struct group_ecmp_datapath *ged,
+    const struct uuid *route_uuid);
 
 void ecmp_groups_add_route(struct ecmp_groups_node *group,
                            const struct parsed_route *route);

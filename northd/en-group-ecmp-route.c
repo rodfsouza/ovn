@@ -160,6 +160,7 @@ group_ecmp_datapath_add(struct group_ecmp_route_data *data,
     hmap_init(&ged->ecmp_groups);
     hmap_init(&ged->unique_routes);
     ovs_list_init(&ged->parsed_routes);
+    hmap_init(&ged->parsed_routes_by_uuid);
     hmap_init(&ged->route_nodes);
     hmap_insert(&data->datapaths, &ged->hmap_node,
                 uuid_hash(&od->key));
@@ -180,12 +181,27 @@ group_ecmp_datapath_lookup(const struct group_ecmp_route_data *data,
     return NULL;
 }
 
+struct parsed_route *
+parsed_route_lookup_by_uuid(const struct group_ecmp_datapath *ged,
+                            const struct uuid *route_uuid)
+{
+    struct parsed_route *pr;
+    HMAP_FOR_EACH_WITH_HASH (pr, key_node, uuid_hash(route_uuid),
+                             &ged->parsed_routes_by_uuid) {
+        if (uuid_equals(&pr->route->header_.uuid, route_uuid)) {
+            return pr;
+        }
+    }
+    return NULL;
+}
+
 static void
 group_ecmp_datapath_destroy(struct group_ecmp_datapath *ged)
 {
     ecmp_groups_destroy(&ged->ecmp_groups);
     unique_routes_destroy(&ged->unique_routes);
     parsed_routes_destroy(&ged->parsed_routes);
+    hmap_destroy(&ged->parsed_routes_by_uuid);
 
     struct ecmp_route_node *rn;
     HMAP_FOR_EACH_POP (rn, hmap_node, &ged->route_nodes) {
@@ -239,6 +255,8 @@ group_ecmp_route(struct group_ecmp_route_data *data,
         if (!route) {
             continue;
         }
+        hmap_insert(&ged->parsed_routes_by_uuid, &route->key_node,
+                    uuid_hash(&od->nbr->static_routes[i]->header_.uuid));
         struct ecmp_groups_node *group =
             ecmp_groups_find(&ged->ecmp_groups, route);
         if (group) {
@@ -379,6 +397,8 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                 hmap_init(&ged->unique_routes);
                 parsed_routes_destroy(&ged->parsed_routes);
                 ovs_list_init(&ged->parsed_routes);
+                hmap_destroy(&ged->parsed_routes_by_uuid);
+                hmap_init(&ged->parsed_routes_by_uuid);
 
                 /* Rebuild ECMP groups from current routes. */
                 struct simap route_tables = SIMAP_INITIALIZER(&route_tables);
@@ -396,6 +416,10 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                     if (!route) {
                         continue;
                     }
+                    hmap_insert(&ged->parsed_routes_by_uuid,
+                                &route->key_node,
+                                uuid_hash(&od->nbr->static_routes[i]
+                                           ->header_.uuid));
                     struct ecmp_groups_node *group =
                         ecmp_groups_find(&ged->ecmp_groups, route);
                     if (group) {
