@@ -11091,6 +11091,35 @@ build_bfd_table(struct ovsdb_idl_txn *ovnsb_txn,
     bitmap_free(bfd_src_ports);
 }
 
+void
+bfd_update_static_route_refs(const struct ovn_datapaths *lr_datapaths,
+                             struct hmap *bfd_connections)
+{
+    const struct ovn_datapath *od;
+    HMAP_FOR_EACH (od, key_node, &lr_datapaths->datapaths) {
+        if (!od->nbr) {
+            continue;
+        }
+        for (size_t i = 0; i < od->nbr->n_static_routes; i++) {
+            const struct nbrec_logical_router_static_route *route =
+                od->nbr->static_routes[i];
+            const struct nbrec_bfd *nb_bt = route->bfd;
+            if (!nb_bt || strcmp(nb_bt->dst_ip, route->nexthop)) {
+                continue;
+            }
+            struct bfd_entry *bfd_e = bfd_port_lookup(bfd_connections,
+                                                      nb_bt->logical_port,
+                                                      nb_bt->dst_ip);
+            if (bfd_e) {
+                bfd_e->ref = true;
+            }
+            if (!strcmp(nb_bt->status, "admin_down")) {
+                nbrec_bfd_set_status(nb_bt, "down");
+            }
+        }
+    }
+}
+
 /* Returns a string of the IP address of the router port 'op' that
  * overlaps with 'ip_s".  If one is not found, returns NULL.
  *
@@ -11509,25 +11538,34 @@ parsed_routes_add(struct ovn_datapath *od, const struct hmap *lr_ports,
     }
 
     const struct nbrec_bfd *nb_bt = route->bfd;
-    if (nb_bt && bfd_connections && !strcmp(nb_bt->dst_ip, route->nexthop)) {
-        struct bfd_entry *bfd_e;
+    if (nb_bt && !strcmp(nb_bt->dst_ip, route->nexthop)) {
+        if (bfd_connections) {
+            struct bfd_entry *bfd_e;
 
-        bfd_e = bfd_port_lookup(bfd_connections, nb_bt->logical_port,
-                                nb_bt->dst_ip);
-        ovs_mutex_lock(&bfd_lock);
-        if (bfd_e) {
-            bfd_e->ref = true;
-        }
+            bfd_e = bfd_port_lookup(bfd_connections, nb_bt->logical_port,
+                                    nb_bt->dst_ip);
+            ovs_mutex_lock(&bfd_lock);
+            if (bfd_e) {
+                bfd_e->ref = true;
+            }
 
-        if (!strcmp(nb_bt->status, "admin_down")) {
-            nbrec_bfd_set_status(nb_bt, "down");
-        }
+            if (!strcmp(nb_bt->status, "admin_down")) {
+                nbrec_bfd_set_status(nb_bt, "down");
+            }
 
-        if (!strcmp(nb_bt->status, "down")) {
+            if (!strcmp(nb_bt->status, "down")) {
+                ovs_mutex_unlock(&bfd_lock);
+                return NULL;
+            }
             ovs_mutex_unlock(&bfd_lock);
-            return NULL;
+        } else {
+            /* Called from en_group_ecmp_route without bfd_connections.
+             * Exclude routes whose BFD session is not up. */
+            if (!strcmp(nb_bt->status, "admin_down")
+                || !strcmp(nb_bt->status, "down")) {
+                return NULL;
+            }
         }
-        ovs_mutex_unlock(&bfd_lock);
     }
 
     struct parsed_route *pr = xzalloc(sizeof *pr);
@@ -13901,7 +13939,6 @@ build_static_route_flows_for_lrouter(
                                     rn->lflow_ref);
         }
     }
-    simap_destroy(&route_tables);
 }
 
 /* IP Multicast lookup. Here we set the output port, adjust TTL and

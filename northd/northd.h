@@ -885,6 +885,8 @@ void build_bfd_table(struct ovsdb_idl_txn *ovnsb_txn,
                      struct hmap *bfd_connections);
 void bfd_cleanup_connections(const struct nbrec_bfd_table *,
                              struct hmap *bfd_map);
+void bfd_update_static_route_refs(const struct ovn_datapaths *lr_datapaths,
+                                  struct hmap *bfd_connections);
 void run_update_worker_pool(int n_threads);
 
 const struct ovn_datapath *northd_get_datapath_for_port(

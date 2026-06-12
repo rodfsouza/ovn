@@ -114,6 +114,8 @@ void en_lflow_run(struct engine_node *node, void *data)
                     lflow_input.sbrec_bfd_table,
                     lflow_input.lr_ports,
                     &bfd_connections);
+    bfd_update_static_route_refs(lflow_input.lr_datapaths,
+                                 &bfd_connections);
     build_lflows(eng_ctx->ovnsb_idl_txn, &lflow_input,
                  lflow_data->lflow_table);
     bfd_cleanup_connections(lflow_input.nbrec_bfd_table,
