@@ -11509,7 +11509,7 @@ parsed_routes_add(struct ovn_datapath *od, const struct hmap *lr_ports,
     }
 
     const struct nbrec_bfd *nb_bt = route->bfd;
-    if (nb_bt && !strcmp(nb_bt->dst_ip, route->nexthop)) {
+    if (nb_bt && bfd_connections && !strcmp(nb_bt->dst_ip, route->nexthop)) {
         struct bfd_entry *bfd_e;
 
         bfd_e = bfd_port_lookup(bfd_connections, nb_bt->logical_port,
