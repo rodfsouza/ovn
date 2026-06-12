@@ -220,6 +220,16 @@ group_ecmp_route(struct group_ecmp_route_data *data,
     struct group_ecmp_datapath *ged = group_ecmp_datapath_add(data, od);
     struct simap route_tables = SIMAP_INITIALIZER(&route_tables);
 
+    /* Pre-populate route_tables from LRP options so IDs match the
+     * lr_in_ip_routing_pre flows built by build_route_table_lflow(). */
+    for (int i = 0; i < od->nbr->n_ports; i++) {
+        const char *rt = smap_get(&od->nbr->ports[i]->options,
+                                  "route_table");
+        if (rt && rt[0]) {
+            get_route_table_id(&route_tables, rt);
+        }
+    }
+
     for (int i = 0; i < od->nbr->n_static_routes; i++) {
         struct parsed_route *route =
             parsed_routes_add(od, lr_ports, &ged->parsed_routes,

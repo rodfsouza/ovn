@@ -11428,7 +11428,7 @@ route_table_add(struct simap *route_tables, const char *route_table_name)
     return rtb_id;
 }
 
-static uint32_t
+uint32_t
 get_route_table_id(struct simap *route_tables, const char *route_table_name)
 {
     if (!route_table_name || !route_table_name[0]) {

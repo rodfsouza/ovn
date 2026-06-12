@@ -841,6 +841,8 @@ struct parsed_route *parsed_routes_add(
     const struct nbrec_logical_router_static_route *route,
     const struct hmap *bfd_connections);
 void parsed_routes_destroy(struct ovs_list *routes);
+uint32_t get_route_table_id(struct simap *route_tables,
+                            const char *route_table_name);
 
 /* Route flow generation (used by en-lflow.c and en-group-ecmp-route.c). */
 void build_ip_routing_pre_flows_for_lrouter(struct ovn_datapath *od,
