@@ -11560,8 +11560,10 @@ parsed_routes_add(struct ovn_datapath *od, const struct hmap *lr_ports,
             ovs_mutex_unlock(&bfd_lock);
         } else {
             /* Called from en_group_ecmp_route without bfd_connections.
-             * Exclude routes whose BFD session is not up. */
-            if (!strcmp(nb_bt->status, "admin_down")
+             * Exclude routes whose BFD session is not up.
+             * Status may be NULL if build_bfd_table() hasn't run yet. */
+            if (!nb_bt->status
+                || !strcmp(nb_bt->status, "admin_down")
                 || !strcmp(nb_bt->status, "down")) {
                 return NULL;
             }
