@@ -864,6 +864,15 @@ struct parsed_route *parsed_routes_add(
     const struct hmap *bfd_connections);
 void parsed_routes_destroy(struct ovs_list *routes);
 
+/* Route flow generation (used by en-lflow.c). */
+void build_ecmp_route_flow(struct lflow_table *lflows,
+    struct ovn_datapath *od, bool ct_masked_mark,
+    const struct hmap *lr_ports, struct ecmp_groups_node *eg,
+    struct lflow_ref *lflow_ref);
+void build_static_route_flow(struct lflow_table *lflows,
+    struct ovn_datapath *od, const struct hmap *lr_ports,
+    const struct parsed_route *route_, struct lflow_ref *lflow_ref);
+
 /* Per-route flow ref helpers (used by en-lflow.c). */
 struct route_flow_ref *route_flow_ref_find(const struct hmap *route_refs,
                                            const struct uuid *uuid);

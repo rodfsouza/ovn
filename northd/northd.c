@@ -12002,7 +12002,7 @@ add_ecmp_symmetric_reply_flows(struct lflow_table *lflows,
     ds_destroy(&ecmp_reply);
 }
 
-static void
+void
 build_ecmp_route_flow(struct lflow_table *lflows, struct ovn_datapath *od,
                       bool ct_masked_mark, const struct hmap *lr_ports,
                       struct ecmp_groups_node *eg,
@@ -12175,7 +12175,7 @@ add_route(struct lflow_table *lflows, struct ovn_datapath *od,
     ds_destroy(&actions);
 }
 
-static void
+void
 build_static_route_flow(struct lflow_table *lflows, struct ovn_datapath *od,
                         const struct hmap *lr_ports,
                         const struct parsed_route *route_,
