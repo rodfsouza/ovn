@@ -46,6 +46,7 @@
 #include "memory.h"
 #include "northd.h"
 #include "en-global-config.h"
+#include "en-group-ecmp-route.h"
 #include "en-lb-data.h"
 #include "en-lr-nat.h"
 #include "en-lr-stateful.h"
@@ -11638,151 +11639,10 @@ parsed_routes_destroy(struct ovs_list *routes)
     }
 }
 
-struct ecmp_route_list_node {
-    struct ovs_list list_node;
-    uint16_t id; /* starts from 1 */
-    const struct parsed_route *route;
-};
-
-struct ecmp_groups_node {
-    struct hmap_node hmap_node; /* In ecmp_groups */
-    uint16_t id; /* starts from 1 */
-    struct in6_addr prefix;
-    unsigned int plen;
-    bool is_src_route;
-    bool has_discard_route;
-    const char *origin;
-    uint32_t route_table_id;
-    uint16_t route_count;
-    struct ovs_list route_list; /* Contains ecmp_route_list_node */
-};
-
-static void
-ecmp_groups_add_route(struct ecmp_groups_node *group,
-                      const struct parsed_route *route)
-{
-    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-    if (group->route_count == UINT16_MAX) {
-        VLOG_WARN_RL(&rl, "too many routes in a single ecmp group.");
-        return;
-    }
-
-    if (route->is_discard_route) {
-        group->has_discard_route = true;
-
-        char *prefix = normalize_v46_prefix(&route->prefix, route->plen);
-        VLOG_WARN_RL(&rl, "The ECMP route \"%s\" contains \"discard\" "
-                     "route, the whole group will drop traffic.", prefix);
-        free(prefix);
-    }
-
-    struct ecmp_route_list_node *er = xmalloc(sizeof *er);
-    er->route = route;
-    er->id = ++group->route_count;
-    ovs_list_insert(&group->route_list, &er->list_node);
-}
-
-static struct ecmp_groups_node *
-ecmp_groups_add(struct hmap *ecmp_groups,
-                const struct parsed_route *route)
-{
-    if (hmap_count(ecmp_groups) == UINT16_MAX) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-        VLOG_WARN_RL(&rl, "too many ecmp groups.");
-        return NULL;
-    }
-
-    struct ecmp_groups_node *eg = xzalloc(sizeof *eg);
-    hmap_insert(ecmp_groups, &eg->hmap_node, route->hash);
-
-    eg->id = hmap_count(ecmp_groups);
-    eg->prefix = route->prefix;
-    eg->plen = route->plen;
-    eg->is_src_route = route->is_src_route;
-    eg->origin = smap_get_def(&route->route->options, "origin", "");
-    eg->route_table_id = route->route_table_id;
-    ovs_list_init(&eg->route_list);
-    ecmp_groups_add_route(eg, route);
-
-    return eg;
-}
-
-static struct ecmp_groups_node *
-ecmp_groups_find(struct hmap *ecmp_groups, struct parsed_route *route)
-{
-    struct ecmp_groups_node *eg;
-    HMAP_FOR_EACH_WITH_HASH (eg, hmap_node, route->hash, ecmp_groups) {
-        if (ipv6_addr_equals(&eg->prefix, &route->prefix) &&
-            eg->plen == route->plen &&
-            eg->is_src_route == route->is_src_route &&
-            eg->route_table_id == route->route_table_id) {
-            return eg;
-        }
-    }
-    return NULL;
-}
-
-static void
-ecmp_groups_destroy(struct hmap *ecmp_groups)
-{
-    struct ecmp_groups_node *eg;
-    HMAP_FOR_EACH_SAFE (eg, hmap_node, ecmp_groups) {
-        struct ecmp_route_list_node *er;
-        LIST_FOR_EACH_SAFE (er, list_node, &eg->route_list) {
-            ovs_list_remove(&er->list_node);
-            free(er);
-        }
-        hmap_remove(ecmp_groups, &eg->hmap_node);
-        free(eg);
-    }
-    hmap_destroy(ecmp_groups);
-}
-
-struct unique_routes_node {
-    struct hmap_node hmap_node;
-    const struct parsed_route *route;
-};
-
-static void
-unique_routes_add(struct hmap *unique_routes,
-                  const struct parsed_route *route)
-{
-    struct unique_routes_node *ur = xmalloc(sizeof *ur);
-    ur->route = route;
-    hmap_insert(unique_routes, &ur->hmap_node, route->hash);
-}
-
-/* Remove the unique_routes_node from the hmap, and return the parsed_route
- * pointed by the removed node. */
-static const struct parsed_route *
-unique_routes_remove(struct hmap *unique_routes,
-                     const struct parsed_route *route)
-{
-    struct unique_routes_node *ur;
-    HMAP_FOR_EACH_WITH_HASH (ur, hmap_node, route->hash, unique_routes) {
-        if (ipv6_addr_equals(&route->prefix, &ur->route->prefix) &&
-            route->plen == ur->route->plen &&
-            route->is_src_route == ur->route->is_src_route &&
-            route->route_table_id == ur->route->route_table_id) {
-            hmap_remove(unique_routes, &ur->hmap_node);
-            const struct parsed_route *existed_route = ur->route;
-            free(ur);
-            return existed_route;
-        }
-    }
-    return NULL;
-}
-
-static void
-unique_routes_destroy(struct hmap *unique_routes)
-{
-    struct unique_routes_node *ur;
-    HMAP_FOR_EACH_SAFE (ur, hmap_node, unique_routes) {
-        hmap_remove(unique_routes, &ur->hmap_node);
-        free(ur);
-    }
-    hmap_destroy(unique_routes);
-}
+/* ecmp_route_list_node, ecmp_groups_node, unique_routes_node structs
+ * and their helper functions (ecmp_groups_add/find/destroy,
+ * unique_routes_add/remove/destroy) are defined in
+ * en-group-ecmp-route.h/c. */
 
 static char *
 build_route_prefix_s(const struct in6_addr *prefix, unsigned int plen)
@@ -14085,10 +13945,12 @@ static void
 build_static_route_flows_for_lrouter(
         struct ovn_datapath *od, const struct chassis_features *features,
         struct lflow_table *lflows, const struct hmap *lr_ports,
-        const struct hmap *bfd_connections,
+        const struct hmap *bfd_connections OVS_UNUSED,
+        const struct group_ecmp_route_data *group_ecmp_data,
         struct lflow_ref *lflow_ref)
 {
     ovs_assert(od->nbr);
+    /* Skeleton flows — tracked by od->route_lflow_ref. */
     ovn_lflow_add_default_drop(lflows, od, S_ROUTER_IN_IP_ROUTING_ECMP,
                                lflow_ref);
     ovn_lflow_add_default_drop(lflows, od, S_ROUTER_IN_IP_ROUTING,
@@ -14097,66 +13959,32 @@ build_static_route_flows_for_lrouter(
                   REG_ECMP_GROUP_ID" == 0", "next;",
                   lflow_ref);
 
-    struct hmap ecmp_groups = HMAP_INITIALIZER(&ecmp_groups);
-    struct hmap unique_routes = HMAP_INITIALIZER(&unique_routes);
-    struct ovs_list parsed_routes = OVS_LIST_INITIALIZER(&parsed_routes);
+    /* Route table per-LRP flows — tracked by od->route_lflow_ref. */
     struct simap route_tables = SIMAP_INITIALIZER(&route_tables);
-    struct ecmp_groups_node *group;
-
     for (int i = 0; i < od->nbr->n_ports; i++) {
         build_route_table_lflow(od, lflows, od->nbr->ports[i],
                                 &route_tables, lflow_ref);
     }
+    simap_destroy(&route_tables);
 
-    for (int i = 0; i < od->nbr->n_static_routes; i++) {
-        struct parsed_route *route =
-            parsed_routes_add(od, lr_ports, &parsed_routes, &route_tables,
-                              od->nbr->static_routes[i], bfd_connections);
-        if (!route) {
-            continue;
-        }
-        group = ecmp_groups_find(&ecmp_groups, route);
-        if (group) {
-            ecmp_groups_add_route(group, route);
+    /* Use pre-computed ECMP groups from group_ecmp_route node.
+     * Each route_node has its own lflow_ref for per-route tracking. */
+    const struct group_ecmp_datapath *ged =
+        group_ecmp_datapath_lookup(group_ecmp_data, od);
+    if (!ged) {
+        return;
+    }
+
+    struct ecmp_route_node *rn;
+    HMAP_FOR_EACH (rn, hmap_node, &ged->route_nodes) {
+        if (rn->is_ecmp) {
+            build_ecmp_route_flow(lflows, od, features->ct_no_masked_label,
+                                  lr_ports, rn->group, rn->lflow_ref);
         } else {
-            const struct parsed_route *existed_route =
-                unique_routes_remove(&unique_routes, route);
-            if (existed_route) {
-                group = ecmp_groups_add(&ecmp_groups, existed_route);
-                if (group) {
-                    ecmp_groups_add_route(group, route);
-                }
-            } else if (route->ecmp_symmetric_reply) {
-                /* Traffic for symmetric reply routes has to be conntracked
-                 * even if there is only one next-hop, in case another next-hop
-                 * is added later. */
-                ecmp_groups_add(&ecmp_groups, route);
-            } else {
-                unique_routes_add(&unique_routes, route);
-            }
+            build_static_route_flow(lflows, od, lr_ports, rn->route,
+                                    rn->lflow_ref);
         }
     }
-    HMAP_FOR_EACH (group, hmap_node, &ecmp_groups) {
-        /* ECMP routes use the router-level route_lflow_ref (Phase 1). */
-        build_ecmp_route_flow(lflows, od, features->ct_no_masked_label,
-                              lr_ports, group, lflow_ref);
-    }
-    /* Clear old per-route refs before repopulating. */
-    route_flow_refs_clear(&od->route_refs);
-
-    const struct unique_routes_node *ur;
-    HMAP_FOR_EACH (ur, hmap_node, &unique_routes) {
-        /* Each unique (non-ECMP) route gets its own lflow_ref so it
-         * can be added/removed independently during incremental
-         * processing without rebuilding all routes. */
-        struct route_flow_ref *rfr = route_flow_ref_create(
-            &od->route_refs, &ur->route->route->header_.uuid);
-        build_static_route_flow(lflows, od, lr_ports, ur->route,
-                                rfr->lflow_ref);
-    }
-    ecmp_groups_destroy(&ecmp_groups);
-    unique_routes_destroy(&unique_routes);
-    parsed_routes_destroy(&parsed_routes);
     simap_destroy(&route_tables);
 }
 
@@ -17381,6 +17209,7 @@ struct lswitch_flow_build_info {
     const struct hmap *svc_monitor_map;
     const struct hmap *bfd_connections;
     const struct chassis_features *features;
+    const struct group_ecmp_route_data *group_ecmp_data;
     char *svc_check_match;
     struct ds match;
     struct ds actions;
@@ -17461,6 +17290,7 @@ build_lswitch_and_lrouter_iterate_by_lr(struct ovn_datapath *od,
     build_static_route_flows_for_lrouter(od, lsi->features,
                                          lsi->lflows, lsi->lr_ports,
                                          lsi->bfd_connections,
+                                         lsi->group_ecmp_data,
                                          od->route_lflow_ref);
 
     /* Policy-specific flows → tracked via od->policy_lflow_ref. */
@@ -17521,6 +17351,7 @@ build_lr_route_flows_for_datapath(struct ovn_datapath *od,
                                          lflows,
                                          input_data->lr_ports,
                                          input_data->bfd_connections,
+                                         input_data->group_ecmp_data,
                                          od->route_lflow_ref);
 
     ds_destroy(&match);
@@ -17831,6 +17662,7 @@ build_lswitch_and_lrouter_flows(
     const struct hmap *svc_monitor_map,
     const struct hmap *bfd_connections,
     const struct chassis_features *features,
+    const struct group_ecmp_route_data *group_ecmp_data,
     const char *svc_monitor_mac)
 {
 
@@ -17862,6 +17694,7 @@ build_lswitch_and_lrouter_flows(
             lsiv[index].svc_monitor_map = svc_monitor_map;
             lsiv[index].bfd_connections = bfd_connections;
             lsiv[index].features = features;
+            lsiv[index].group_ecmp_data = group_ecmp_data;
             lsiv[index].svc_check_match = svc_check_match;
             lsiv[index].thread_lflow_counter = 0;
             lsiv[index].svc_monitor_mac = svc_monitor_mac;
@@ -17903,6 +17736,7 @@ build_lswitch_and_lrouter_flows(
             .svc_monitor_map = svc_monitor_map,
             .bfd_connections = bfd_connections,
             .features = features,
+            .group_ecmp_data = group_ecmp_data,
             .svc_check_match = svc_check_match,
             .svc_monitor_mac = svc_monitor_mac,
             .match = DS_EMPTY_INITIALIZER,
@@ -18066,6 +17900,7 @@ void build_lflows(struct ovsdb_idl_txn *ovnsb_txn,
                                     input_data->svc_monitor_map,
                                     input_data->bfd_connections,
                                     input_data->features,
+                                    input_data->group_ecmp_data,
                                     input_data->svc_monitor_mac);
 
     if (parallelization_state == STATE_INIT_HASH_SIZES) {
