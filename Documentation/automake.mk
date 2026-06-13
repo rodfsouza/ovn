@@ -52,6 +52,7 @@ DOC_SOURCE = \
 	Documentation/internals/mailing-lists.rst \
 	Documentation/internals/maintainers.rst \
 	Documentation/incremental-route-processing.md \
+	Documentation/internals/incremental-processing-flows.md \
 	Documentation/internals/ovn-incremental-processing-architecture.md \
 	Documentation/internals/ovn-incremental-processing-plan.md \
 	Documentation/internals/ovs_submodule.rst \
