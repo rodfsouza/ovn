@@ -394,12 +394,18 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                                 rn->hmap_node.hash);
                 }
 
+                /* Keep the old parsed_routes alive until the lflow_ref
+                 * matching loop below; old_rn->route still points into
+                 * them. */
+                struct ovs_list old_parsed_routes =
+                    OVS_LIST_INITIALIZER(&old_parsed_routes);
+                ovs_list_push_back_all(&old_parsed_routes,
+                                       &ged->parsed_routes);
+
                 ecmp_groups_destroy(&ged->ecmp_groups);
                 hmap_init(&ged->ecmp_groups);
                 unique_routes_destroy(&ged->unique_routes);
                 hmap_init(&ged->unique_routes);
-                parsed_routes_destroy(&ged->parsed_routes);
-                ovs_list_init(&ged->parsed_routes);
                 hmap_destroy(&ged->parsed_routes_by_uuid);
                 hmap_init(&ged->parsed_routes_by_uuid);
 
@@ -499,6 +505,7 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                     hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
                 }
                 hmap_destroy(&old_route_nodes);
+                parsed_routes_destroy(&old_parsed_routes);
             } else {
                 /* Router had no routes before, build from scratch. */
                 group_ecmp_route(data, od, &northd_data->lr_ports, NULL);
