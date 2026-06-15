@@ -1026,12 +1026,12 @@ sync_lflow_to_sb(struct ovn_lflow *lflow,
     bool is_switch;
 
     if (ovn_stage_to_datapath_type(lflow->stage) == DP_SWITCH) {
-        n_datapaths = ods_size(ls_datapaths);
+        n_datapaths = ods_array_size(ls_datapaths);
         datapaths_array = ls_datapaths->array;
         dp_groups = &lflow_table->ls_dp_groups;
         is_switch = true;
     } else {
-        n_datapaths = ods_size(lr_datapaths);
+        n_datapaths = ods_array_size(lr_datapaths);
         datapaths_array = lr_datapaths->array;
         dp_groups = &lflow_table->lr_dp_groups;
         is_switch = false;
@@ -1046,7 +1046,7 @@ sync_lflow_to_sb(struct ovn_lflow *lflow,
         size_t index = bitmap_scan(lflow->dpg_bitmap, true, 0,
                                     n_datapaths);
 
-        lflow->od = datapaths_array[index];
+        lflow->od = (index < n_datapaths) ? datapaths_array[index] : NULL;
         lflow->dpg = NULL;
     } else {
         lflow->od = NULL;

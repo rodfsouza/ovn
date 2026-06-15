@@ -19,13 +19,14 @@
 #include <stdio.h>
 
 #include "en-global-config.h"
+#include "en-group-ecmp-route.h"
 #include "en-lflow.h"
 #include "en-lr-nat.h"
 #include "en-lr-stateful.h"
 #include "en-ls-stateful.h"
 #include "en-northd.h"
-#include "en-meters.h"
 #include "lflow-mgr.h"
+#include "en-meters.h"
 
 #include "lib/inc-proc-eng.h"
 #include "northd.h"
@@ -80,6 +81,10 @@ lflow_get_input_data(struct engine_node *node,
     lflow_input->svc_monitor_map = &northd_data->svc_monitor_map;
     lflow_input->bfd_connections = NULL;
 
+    struct group_ecmp_route_data *gerd =
+        engine_get_input_data("group_ecmp_route", node);
+    lflow_input->group_ecmp_data = gerd;
+
     struct ed_type_global_config *global_config =
         engine_get_input_data("global_config", node);
     lflow_input->features = &global_config->features;
@@ -109,6 +114,8 @@ void en_lflow_run(struct engine_node *node, void *data)
                     lflow_input.sbrec_bfd_table,
                     lflow_input.lr_ports,
                     &bfd_connections);
+    bfd_update_static_route_refs(lflow_input.lr_datapaths,
+                                 &bfd_connections);
     build_lflows(eng_ctx->ovnsb_idl_txn, &lflow_input,
                  lflow_data->lflow_table);
     bfd_cleanup_connections(lflow_input.nbrec_bfd_table,
@@ -128,16 +135,100 @@ lflow_northd_handler(struct engine_node *node,
         return false;
     }
 
+    /* Router deletion: lflow_refs were already cleared in the northd
+     * handler. Any flows that were only referenced by the deleted
+     * datapath will be garbage collected during the next full lflow
+     * sync. For now, trigger lflow recompute to ensure proper cleanup
+     * of datapath group memberships in shared flows. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_DELETED) {
+        return false;
+    }
+
     const struct engine_context *eng_ctx = engine_get_context();
     struct lflow_data *lflow_data = data;
 
     struct lflow_input lflow_input;
     lflow_get_input_data(node, &lflow_input);
 
+    /* Handle new router datapaths — generate base flows incrementally
+     * using per-datapath lflow_ref, then sync to SB. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_CREATED) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node, &northd_data->trk_data.trk_created_lrs) {
+            struct ovn_datapath *od = hmapx_node->data;
+
+            build_lr_flows_for_datapath(od, &lflow_input,
+                                        lflow_data->lflow_table);
+
+            if (!lflow_ref_sync_lflows(
+                    od->lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)
+                || !lflow_ref_sync_lflows(
+                    od->route_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)
+                || !lflow_ref_sync_lflows(
+                    od->policy_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
+            }
+        }
+    }
+
+    /* Per-route flow changes are handled by lflow_group_ecmp_route_handler.
+     * Route skeleton flows (default drops, ecmp bypass, route_table lflows)
+     * on od->route_lflow_ref don't change when routes are added/deleted,
+     * so no action needed here for NORTHD_TRACKED_LR_ROUTES. */
+
+    /* Handle routers whose policies changed — rebuild only policy flows. */
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_POLICIES) {
+        struct hmapx_node *hmapx_node;
+        HMAPX_FOR_EACH (hmapx_node,
+                        &northd_data->trk_data.lr_with_changed_policies) {
+            struct ovn_datapath *od = hmapx_node->data;
+
+            lflow_ref_unlink_lflows(od->policy_lflow_ref);
+            build_lr_policy_flows_for_datapath(od, &lflow_input,
+                                               lflow_data->lflow_table);
+            if (!lflow_ref_sync_lflows(
+                    od->policy_lflow_ref, lflow_data->lflow_table,
+                    eng_ctx->ovnsb_idl_txn,
+                    lflow_input.ls_datapaths,
+                    lflow_input.lr_datapaths,
+                    false,
+                    lflow_input.sbrec_logical_flow_table,
+                    lflow_input.sbrec_logical_dp_group_table)) {
+                return false;
+            }
+        }
+    }
+
     if (!lflow_handle_northd_port_changes(eng_ctx->ovnsb_idl_txn,
                                           &northd_data->trk_data.trk_lsps,
                                           &lflow_input,
                                           lflow_data->lflow_table)) {
+        return false;
+    }
+
+    if (!lflow_handle_northd_lr_port_changes(
+            eng_ctx->ovnsb_idl_txn,
+            &northd_data->trk_data.trk_lrps,
+            &lflow_input,
+            lflow_data->lflow_table)) {
         return false;
     }
 
@@ -215,6 +306,79 @@ lflow_ls_stateful_handler(struct engine_node *node, void *data)
                                           &lflow_input,
                                           lflow_data->lflow_table)) {
         return false;
+    }
+
+    engine_set_node_state(node, EN_UPDATED);
+    return true;
+}
+
+bool
+lflow_group_ecmp_route_handler(struct engine_node *node, void *data)
+{
+    struct group_ecmp_route_data *gerd =
+        engine_get_input_data("group_ecmp_route", node);
+
+    if (hmapx_is_empty(&gerd->trk_data.deleted_datapath_routes)
+        && hmapx_is_empty(&gerd->trk_data.crupdated_datapath_routes)) {
+        return true;
+    }
+
+    const struct engine_context *eng_ctx = engine_get_context();
+    struct lflow_data *lflow_data = data;
+    struct lflow_input lflow_input;
+    lflow_get_input_data(node, &lflow_input);
+
+    /* Handle deleted route nodes — unlink and sync to remove SB flows. */
+    struct hmapx_node *hmapx_node;
+    HMAPX_FOR_EACH (hmapx_node, &gerd->trk_data.deleted_datapath_routes) {
+        struct ecmp_route_node *rn = hmapx_node->data;
+        lflow_ref_unlink_lflows(rn->lflow_ref);
+
+        if (!lflow_ref_sync_lflows(
+                rn->lflow_ref, lflow_data->lflow_table,
+                eng_ctx->ovnsb_idl_txn,
+                lflow_input.ls_datapaths,
+                lflow_input.lr_datapaths,
+                false,
+                lflow_input.sbrec_logical_flow_table,
+                lflow_input.sbrec_logical_dp_group_table)) {
+            return false;
+        }
+    }
+
+    /* Handle created/updated route nodes — rebuild and sync flows. */
+    HMAPX_FOR_EACH (hmapx_node, &gerd->trk_data.crupdated_datapath_routes) {
+        struct ecmp_route_node *rn = hmapx_node->data;
+        lflow_ref_unlink_lflows(rn->lflow_ref);
+
+        if (rn->is_ecmp) {
+            build_ecmp_route_flow(lflow_data->lflow_table,
+                                  (struct ovn_datapath *) rn->od,
+                                  lflow_input.features->ct_no_masked_label,
+                                  lflow_input.lr_ports,
+                                  rn->group, rn->lflow_ref);
+        } else {
+            build_static_route_flow(lflow_data->lflow_table,
+                                    (struct ovn_datapath *) rn->od,
+                                    lflow_input.lr_ports,
+                                    rn->route, rn->lflow_ref);
+        }
+
+        build_arp_request_flows_for_lrouter(rn->od,
+                                            lflow_data->lflow_table,
+                                            lflow_input.meter_groups,
+                                            rn->lflow_ref);
+
+        if (!lflow_ref_sync_lflows(
+                rn->lflow_ref, lflow_data->lflow_table,
+                eng_ctx->ovnsb_idl_txn,
+                lflow_input.ls_datapaths,
+                lflow_input.lr_datapaths,
+                false,
+                lflow_input.sbrec_logical_flow_table,
+                lflow_input.sbrec_logical_dp_group_table)) {
+            return false;
+        }
     }
 
     engine_set_node_state(node, EN_UPDATED);

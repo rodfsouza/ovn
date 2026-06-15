@@ -159,6 +159,24 @@ northd_nb_logical_switch_handler(struct engine_node *node,
 }
 
 bool
+northd_sb_datapath_binding_handler(struct engine_node *node,
+                                    void *data)
+{
+    struct northd_data *nd = data;
+    struct northd_input input_data;
+
+    northd_get_input_data(node, &input_data);
+
+    if (!northd_handle_sb_datapath_binding_changes(
+            input_data.sbrec_datapath_binding_table,
+            &nd->ls_datapaths, &nd->lr_datapaths)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool
 northd_sb_port_binding_handler(struct engine_node *node,
                                void *data)
 {
@@ -180,19 +198,105 @@ bool
 northd_nb_logical_router_handler(struct engine_node *node,
                                  void *data)
 {
+    const struct engine_context *eng_ctx = engine_get_context();
     struct northd_data *nd = data;
     struct northd_input input_data;
 
     northd_get_input_data(node, &input_data);
 
-    if (!northd_handle_lr_changes(&input_data, nd)) {
+    if (!northd_handle_lr_changes(eng_ctx->ovnsb_idl_txn,
+                                  &input_data, nd)) {
         return false;
     }
 
-    if (northd_has_lr_nats_in_tracked_data(&nd->trk_data)) {
+    if (northd_has_tracked_data(&nd->trk_data)) {
         engine_set_node_state(node, EN_UPDATED);
     }
 
+    return true;
+}
+
+bool
+northd_nb_logical_router_port_handler(struct engine_node *node,
+                                      void *data)
+{
+    const struct engine_context *eng_ctx = engine_get_context();
+    struct northd_data *nd = data;
+    struct northd_input input_data;
+
+    northd_get_input_data(node, &input_data);
+
+    const struct nbrec_logical_router_port_table *lrp_table =
+        EN_OVSDB_GET(engine_get_input("NB_logical_router_port", node));
+
+    if (!northd_handle_lrp_changes(eng_ctx->ovnsb_idl_txn,
+                                   lrp_table, &input_data, nd)) {
+        return false;
+    }
+
+    if (northd_has_tracked_data(&nd->trk_data)) {
+        engine_set_node_state(node, EN_UPDATED);
+    }
+
+    return true;
+}
+
+bool
+northd_nb_static_route_handler(struct engine_node *node, void *data)
+{
+    struct northd_data *nd = data;
+
+    const struct nbrec_logical_router_static_route_table *table =
+        EN_OVSDB_GET(engine_get_input(
+            "NB_logical_router_static_route", node));
+
+    const struct nbrec_logical_router_static_route *route;
+    NBREC_LOGICAL_ROUTER_STATIC_ROUTE_TABLE_FOR_EACH_TRACKED(
+            route, table) {
+
+        /* New/deleted routes: parent LR's static_routes column also
+         * changes → northd_handle_lr_changes() populates
+         * trk_routes_added / trk_routes_deleted for these via its diff.
+         * No work needed here. */
+        if (nbrec_logical_router_static_route_is_new(route)
+            || nbrec_logical_router_static_route_is_deleted(route)) {
+            continue;
+        }
+
+        /* Row modification. If BFD is involved, recompute. */
+        if (route->bfd
+            || nbrec_logical_router_static_route_is_updated(route,
+                   NBREC_LOGICAL_ROUTER_STATIC_ROUTE_COL_BFD)) {
+            return false;
+        }
+
+        /* Non-BFD modification: find parent router via index. */
+        struct ovn_datapath *od =
+            route_to_lr_map_find(&nd->route_to_lr_map, route);
+        if (!od) {
+            return false;
+        }
+
+        /* Push to trk_routes_modified so the per-route delta consumer
+         * can update only the affected route_node.  Also add the LR to
+         * lr_with_changed_routes as a safety net: if the delta helper
+         * later returns false (parse failure, missing back-pointer, id
+         * exhaustion), the LR is not claimed by handled_by_delta and the
+         * legacy re-walk path runs to fix bookkeeping. */
+        struct modified_route_node *mrn = xmalloc(sizeof *mrn);
+        mrn->nb_route = route;
+        mrn->od = od;
+        hmap_insert(&nd->trk_data.trk_routes_modified, &mrn->node,
+                    uuid_hash(&route->header_.uuid));
+        hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
+    }
+
+    if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_routes)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES;
+    }
+    if (!hmap_is_empty(&nd->trk_data.trk_routes_modified)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES_DELTA;
+    }
     return true;
 }
 

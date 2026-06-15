@@ -79,12 +79,32 @@ struct ovn_datapaths {
 
     /* The array index of each element in 'datapaths'. */
     struct ovn_datapath **array;
+
+    /* Allocated size of 'array'.  This is the high watermark — it never
+     * decreases on incremental deletion so that downstream tables
+     * (lr_nat_table, lr_stateful_table) indexed by od->index always
+     * have enough room, even when gaps exist from deleted datapaths. */
+    size_t n_array_alloc;
+
+    /* Mutation counter.  Incremented on each incremental add/delete.
+     * Reset to 0 by ods_build_array_index() (full recompute compaction).
+     * When this exceeds ODS_MUTATION_LIMIT, the handler forces a
+     * recompute to compact the array and reclaim gap slots. */
+    size_t n_mutations;
 };
+
+#define ODS_MUTATION_LIMIT 1000
 
 static inline size_t
 ods_size(const struct ovn_datapaths *datapaths)
 {
     return hmap_count(&datapaths->datapaths);
+}
+
+static inline size_t
+ods_array_size(const struct ovn_datapaths *datapaths)
+{
+    return datapaths->n_array_alloc;
 }
 
 bool od_has_lb_vip(const struct ovn_datapath *od);
@@ -113,13 +133,48 @@ struct tracked_lbs {
     struct hmapx deleted;
 };
 
+struct tracked_lr_ports {
+    /* Tracked created LRPs on existing routers.
+     * hmapx node data is 'struct ovn_port *' — alive, flows to generate. */
+    struct hmapx created;
+
+    /* Tracked deleted LRPs on existing routers.
+     * hmapx node data is 'struct ovn_port *' — removed from operational
+     * hmaps (lr_ports, od->ports) but kept alive for lflow cleanup.
+     * Destroyed in destroy_northd_data_tracked_changes(). */
+    struct hmapx deleted;
+};
+
 enum northd_tracked_data_type {
     NORTHD_TRACKED_NONE,
-    NORTHD_TRACKED_PORTS    = (1 << 0),
-    NORTHD_TRACKED_LBS      = (1 << 1),
-    NORTHD_TRACKED_LR_NATS  = (1 << 2),
-    NORTHD_TRACKED_LS_LBS   = (1 << 3),
-    NORTHD_TRACKED_LS_ACLS  = (1 << 4),
+    NORTHD_TRACKED_PORTS       = (1 << 0),
+    NORTHD_TRACKED_LBS         = (1 << 1),
+    NORTHD_TRACKED_LR_NATS     = (1 << 2),
+    NORTHD_TRACKED_LS_LBS      = (1 << 3),
+    NORTHD_TRACKED_LS_ACLS     = (1 << 4),
+    NORTHD_TRACKED_LR_CREATED  = (1 << 5),
+    NORTHD_TRACKED_LR_DELETED  = (1 << 6),
+    NORTHD_TRACKED_LR_ROUTES  = (1 << 7),
+    NORTHD_TRACKED_LR_POLICIES = (1 << 8),
+    NORTHD_TRACKED_LR_PORTS    = (1 << 9),
+    /* Per-route delta tracking: NB rows that were added, deleted, or
+     * modified in this txn. Consumed by en_group_ecmp_route_northd_handler
+     * for O(1) per-route updates instead of full per-LR re-walk. */
+    NORTHD_TRACKED_LR_ROUTES_DELTA = (1 << 10),
+};
+
+/* Per-route delta entries. Captured during northd's input handlers and
+ * consumed by en_group_ecmp_route. */
+struct deleted_route_node {
+    struct hmap_node node;       /* In trk_routes_deleted, keyed by UUID. */
+    struct uuid route_uuid;      /* Captured by value — NB row is gone. */
+    struct ovn_datapath *od;     /* LR the route belonged to. */
+};
+
+struct modified_route_node {
+    struct hmap_node node;       /* In trk_routes_modified, keyed by UUID. */
+    const struct nbrec_logical_router_static_route *nb_route;
+    struct ovn_datapath *od;
 };
 
 /* Track what's changed in the northd engine node.
@@ -129,6 +184,7 @@ struct northd_tracked_data {
     /* Indicates the type of data tracked.  One or all of NORTHD_TRACKED_*. */
     enum northd_tracked_data_type type;
     struct tracked_ovn_ports trk_lsps;
+    struct tracked_lr_ports trk_lrps;
     struct tracked_lbs trk_lbs;
 
     /* Tracked logical routers whose NATs have changed.
@@ -142,7 +198,63 @@ struct northd_tracked_data {
     /* Tracked logical switches whose ACLs have changed.
      * hmapx node is 'struct ovn_datapath *'. */
     struct hmapx ls_with_changed_acls;
+
+    /* Tracked created logical routers (standalone, no ports/NATs).
+     * hmapx node data is 'struct ovn_datapath *' — fully materialized
+     * with SB datapath_binding and tunnel key assigned. */
+    struct hmapx trk_created_lrs;
+
+    /* Tracked deleted logical routers.
+     * hmapx node is 'struct ovn_datapath *'. */
+    struct hmapx trk_deleted_lrs;
+
+    /* Tracked routers whose static routes have changed.
+     * hmapx node data is 'struct ovn_datapath *'. */
+    struct hmapx lr_with_changed_routes;
+
+    /* Tracked routers whose policies have changed.
+     * hmapx node data is 'struct ovn_datapath *'. */
+    struct hmapx lr_with_changed_policies;
+
+    /* Per-route delta tracking. Populated alongside lr_with_changed_routes:
+     * the LR handler diffs old vs new LR.static_routes and pushes new/removed
+     * rows here (it has the LR datapath). The static_route handler pushes
+     * modify rows (the LR row is untouched on modify).
+     *
+     * Consumer: en_group_ecmp_route_northd_handler — uses these for O(1)
+     * per-route updates instead of the full re-walk. The fallback
+     * (lr_with_changed_routes re-walk) remains for safety. */
+    struct hmapx trk_routes_added;        /* of (const nbrec_..._static_route *) */
+    struct hmap  trk_routes_deleted;      /* of deleted_route_node, keyed by UUID */
+    struct hmap  trk_routes_modified;     /* of modified_route_node, keyed by UUID */
 };
+
+/* Maps nbrec_logical_router_port → parent ovn_datapath for O(1) lookup. */
+struct lrp_lr_map_entry {
+    struct hmap_node hmap_node;
+    const struct nbrec_logical_router_port *lrp;
+    struct ovn_datapath *od;
+};
+
+/* Maps nbrec_logical_router_static_route → parent ovn_datapath for O(1). */
+struct route_lr_map_entry {
+    struct hmap_node hmap_node;
+    const struct nbrec_logical_router_static_route *route;
+    struct ovn_datapath *od;
+};
+
+static inline struct ovn_datapath *
+route_to_lr_map_find(const struct hmap *map,
+                     const struct nbrec_logical_router_static_route *route)
+{
+    struct route_lr_map_entry *e;
+    HMAP_FOR_EACH_WITH_HASH (e, hmap_node, hash_pointer(route, 0), map) {
+        if (e->route == route) {
+            return e->od;
+        }
+    }
+    return NULL;
+}
 
 struct northd_data {
     /* Global state for 'en-northd'. */
@@ -155,6 +267,8 @@ struct northd_data {
     struct ovs_list lr_list;
     struct sset svc_monitor_lsps;
     struct hmap svc_monitor_map;
+    struct hmap lrp_to_lr_map;  /* struct lrp_lr_map_entry, by LRP ptr */
+    struct hmap route_to_lr_map; /* struct route_lr_map_entry, by route ptr */
 
     /* Change tracking data. */
     struct northd_tracked_data trk_data;
@@ -188,6 +302,7 @@ struct lflow_input {
     const struct hmap *bfd_connections;
     const struct chassis_features *features;
     const struct hmap *svc_monitor_map;
+    const struct group_ecmp_route_data *group_ecmp_data;
     bool ovn_internal_version_changed;
     const char *svc_monitor_mac;
 };
@@ -284,6 +399,8 @@ struct ovn_datapath {
     const struct nbrec_logical_switch *nbs;  /* May be NULL. */
     const struct nbrec_logical_router *nbr;  /* May be NULL. */
     const struct sbrec_datapath_binding *sb; /* May be NULL. */
+    bool sb_was_inserted; /* True when sb was set via insert (stale
+                           * pointer until SB feedback updates it). */
 
     struct ovs_list list;       /* In list of similar records. */
 
@@ -344,6 +461,21 @@ struct ovn_datapath {
     /* Map of ovn_port objects belonging to this datapath.
      * This map doesn't include derived ports. */
     struct hmap ports;
+
+    /* Per-datapath lflow tracking for incremental flow generation.
+     * General router flows (admission control, NAT defrag, LB affinity,
+     * mcast lookup, gateway redirect, ARP request, network ID, etc.). */
+    struct lflow_ref *lflow_ref;
+
+    /* Route-specific lflow tracking — separated so route changes only
+     * rebuild routing flows, not all datapath flows.
+     * Tracks skeleton flows (default drops, ecmp bypass) and
+     * route_table per-LRP flows. Per-route/group flows are tracked
+     * by ecmp_route_node->lflow_ref in group_ecmp_route_data. */
+    struct lflow_ref *route_lflow_ref;
+
+    /* Policy-specific lflow tracking — separated for the same reason. */
+    struct lflow_ref *policy_lflow_ref;
 };
 
 const struct ovn_datapath *ovn_datapath_find(const struct hmap *datapaths,
@@ -352,7 +484,7 @@ static inline struct ovn_datapath *
 ovn_datapaths_find_by_index(const struct ovn_datapaths *ovn_datapaths,
                             size_t od_index)
 {
-    ovs_assert(od_index <= hmap_count(&ovn_datapaths->datapaths));
+    ovs_assert(od_index < ovn_datapaths->n_array_alloc);
     return ovn_datapaths->array[od_index];
 }
 
@@ -669,8 +801,13 @@ void ovnsb_db_run(struct ovsdb_idl_txn *ovnnb_txn,
 bool northd_handle_ls_changes(struct ovsdb_idl_txn *,
                               const struct northd_input *,
                               struct northd_data *);
-bool northd_handle_lr_changes(const struct northd_input *,
+bool northd_handle_lr_changes(struct ovsdb_idl_txn *,
+                              const struct northd_input *,
                               struct northd_data *);
+bool northd_handle_lrp_changes(struct ovsdb_idl_txn *,
+                               const struct nbrec_logical_router_port_table *,
+                               const struct northd_input *,
+                               struct northd_data *);
 void destroy_northd_data_tracked_changes(struct northd_data *);
 void northd_destroy(struct northd_data *data);
 void northd_init(struct northd_data *data);
@@ -684,16 +821,87 @@ struct ls_stateful_tracked_data;
 void build_lflows(struct ovsdb_idl_txn *ovnsb_txn,
                   struct lflow_input *input_data,
                   struct lflow_table *);
+void build_lr_flows_for_datapath(struct ovn_datapath *od,
+                                 struct lflow_input *input_data,
+                                 struct lflow_table *lflows);
+void build_lr_route_flows_for_datapath(struct ovn_datapath *od,
+                                       struct lflow_input *input_data,
+                                       struct lflow_table *lflows);
+void build_lr_policy_flows_for_datapath(struct ovn_datapath *od,
+                                        struct lflow_input *input_data,
+                                        struct lflow_table *lflows);
 void lflow_reset_northd_refs(struct lflow_input *);
 
 bool lflow_handle_northd_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
                                       struct tracked_ovn_ports *,
                                       struct lflow_input *,
                                       struct lflow_table *lflows);
+bool lflow_handle_northd_lr_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
+                                          struct tracked_lr_ports *,
+                                          struct lflow_input *,
+                                          struct lflow_table *lflows);
 bool lflow_handle_northd_lb_changes(struct ovsdb_idl_txn *ovnsb_txn,
                                     struct tracked_lbs *,
                                     struct lflow_input *,
                                     struct lflow_table *lflows);
+/* Forward decl from en-group-ecmp-route.h; back-pointer below lets us locate
+ * the owning route_node from a parsed_route in O(1) for per-route incremental
+ * updates. */
+struct ecmp_route_node;
+
+/* Parsed static route — used by northd.c and en-group-ecmp-route.c. */
+struct parsed_route {
+    struct ovs_list list_node;
+    struct hmap_node key_node;  /* In group_ecmp_datapath.parsed_routes_by_uuid */
+    struct in6_addr prefix;
+    unsigned int plen;
+    bool is_src_route;
+    uint32_t route_table_id;
+    uint32_t hash;
+    const struct nbrec_logical_router_static_route *route;
+    bool ecmp_symmetric_reply;
+    bool is_discard_route;
+    bool stale;
+    /* Back-pointer to the route_node that owns this parsed_route's lflow_ref.
+     * For unique routes, points to the unique route_node. For ECMP-grouped
+     * routes, all members of the same group share the same route_node here.
+     * NULL when no route_node currently exists. Invariant maintained by
+     * en-group-ecmp-route.c at every allocation and free site. */
+    struct ecmp_route_node *route_node;
+};
+
+static inline uint32_t
+route_hash(struct parsed_route *route)
+{
+    return hash_bytes(&route->prefix, sizeof route->prefix,
+                      (uint32_t)route->plen);
+}
+
+/* Parsed route helpers (used by en-group-ecmp-route.c). */
+struct parsed_route *parsed_routes_add(
+    struct ovn_datapath *od, const struct hmap *lr_ports,
+    struct ovs_list *routes, struct simap *route_tables,
+    const struct nbrec_logical_router_static_route *route,
+    const struct hmap *bfd_connections);
+void parsed_routes_destroy(struct ovs_list *routes);
+uint32_t get_route_table_id(struct simap *route_tables,
+                            const char *route_table_name);
+
+/* Route flow generation (used by en-lflow.c and en-group-ecmp-route.c). */
+void build_ip_routing_pre_flows_for_lrouter(struct ovn_datapath *od,
+    struct lflow_table *lflows, struct lflow_ref *lflow_ref);
+struct ecmp_groups_node;
+void build_ecmp_route_flow(struct lflow_table *lflows,
+    struct ovn_datapath *od, bool ct_masked_mark,
+    const struct hmap *lr_ports, struct ecmp_groups_node *eg,
+    struct lflow_ref *lflow_ref);
+void build_static_route_flow(struct lflow_table *lflows,
+    struct ovn_datapath *od, const struct hmap *lr_ports,
+    const struct parsed_route *route_, struct lflow_ref *lflow_ref);
+void build_arp_request_flows_for_lrouter(
+    const struct ovn_datapath *od, struct lflow_table *lflows,
+    const struct shash *meter_groups, struct lflow_ref *lflow_ref);
+
 bool lflow_handle_lr_stateful_changes(struct ovsdb_idl_txn *,
                                       struct lr_stateful_tracked_data *,
                                       struct lflow_input *,
@@ -702,6 +910,10 @@ bool lflow_handle_ls_stateful_changes(struct ovsdb_idl_txn *,
                                       struct ls_stateful_tracked_data *,
                                       struct lflow_input *,
                                       struct lflow_table *lflows);
+bool northd_handle_sb_datapath_binding_changes(
+    const struct sbrec_datapath_binding_table *,
+    struct ovn_datapaths *ls_datapaths,
+    struct ovn_datapaths *lr_datapaths);
 bool northd_handle_sb_port_binding_changes(
     const struct sbrec_port_binding_table *, struct hmap *ls_ports,
     struct hmap *lr_ports);
@@ -721,6 +933,8 @@ void build_bfd_table(struct ovsdb_idl_txn *ovnsb_txn,
                      struct hmap *bfd_connections);
 void bfd_cleanup_connections(const struct nbrec_bfd_table *,
                              struct hmap *bfd_map);
+void bfd_update_static_route_refs(const struct ovn_datapaths *lr_datapaths,
+                                  struct hmap *bfd_connections);
 void run_update_worker_pool(int n_threads);
 
 const struct ovn_datapath *northd_get_datapath_for_port(
@@ -755,6 +969,13 @@ static inline bool
 northd_has_lr_nats_in_tracked_data(struct northd_tracked_data *trk_nd_changes)
 {
     return trk_nd_changes->type & NORTHD_TRACKED_LR_NATS;
+}
+
+static inline bool
+northd_has_route_deltas_in_tracked_data(
+    const struct northd_tracked_data *trk_nd_changes)
+{
+    return trk_nd_changes->type & NORTHD_TRACKED_LR_ROUTES_DELTA;
 }
 
 static inline bool

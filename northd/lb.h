@@ -135,9 +135,11 @@ struct ovn_lb_datapaths {
     const struct ovn_northd_lb *lb;
     size_t n_nb_ls;
     unsigned long *nb_ls_map;
+    size_t nb_ls_map_n_bits;   /* Allocated bitmap size. */
 
     size_t n_nb_lr;
     unsigned long *nb_lr_map;
+    size_t nb_lr_map_n_bits;   /* Allocated bitmap size. */
 
     /* Reference of lflows generated for this load balancer.
      *
@@ -179,6 +181,14 @@ void ovn_lb_datapaths_add_lr(struct ovn_lb_datapaths *, size_t n,
 void ovn_lb_datapaths_add_ls(struct ovn_lb_datapaths *, size_t n,
                              struct ovn_datapath **);
 
+/* Ensure bitmaps can hold at least 'n_bits' entries.  Called after adding
+ * a new datapath to resize ALL LB bitmaps so BITMAP_FOR_EACH_1 callers
+ * (which use ods_size() as upper bound) never read past the allocation. */
+void ovn_lb_datapaths_ensure_lr_bitmap_size(struct ovn_lb_datapaths *,
+                                             size_t n_bits);
+void ovn_lb_datapaths_ensure_ls_bitmap_size(struct ovn_lb_datapaths *,
+                                             size_t n_bits);
+
 struct ovn_lb_group_datapaths {
     struct hmap_node hmap_node;
 
@@ -186,8 +196,10 @@ struct ovn_lb_group_datapaths {
 
     /* Datapaths to which 'lb_group' is applied. */
     size_t n_ls;
+    size_t max_ls;
     struct ovn_datapath **ls;
     size_t n_lr;
+    size_t max_lr;
     struct ovn_datapath **lr;
 };
 
@@ -203,6 +215,11 @@ static inline void
 ovn_lb_group_datapaths_add_ls(struct ovn_lb_group_datapaths *lbg_dps, size_t n,
                                struct ovn_datapath **ods)
 {
+    if (lbg_dps->n_ls + n > lbg_dps->max_ls) {
+        lbg_dps->max_ls = MAX(lbg_dps->max_ls * 2, lbg_dps->n_ls + n);
+        lbg_dps->ls = xrealloc(lbg_dps->ls,
+                                lbg_dps->max_ls * sizeof *lbg_dps->ls);
+    }
     memcpy(&lbg_dps->ls[lbg_dps->n_ls], ods, n * sizeof *ods);
     lbg_dps->n_ls += n;
 }
@@ -211,6 +228,11 @@ static inline void
 ovn_lb_group_datapaths_add_lr(struct ovn_lb_group_datapaths *lbg_dps,
                                struct ovn_datapath *lr)
 {
+    if (lbg_dps->n_lr >= lbg_dps->max_lr) {
+        lbg_dps->max_lr = MAX(lbg_dps->max_lr * 2, lbg_dps->n_lr + 1);
+        lbg_dps->lr = xrealloc(lbg_dps->lr,
+                                lbg_dps->max_lr * sizeof *lbg_dps->lr);
+    }
     lbg_dps->lr[lbg_dps->n_lr++] = lr;
 }
 

@@ -36,6 +36,7 @@
 #include "en-lr-nat.h"
 #include "en-ls-stateful.h"
 #include "en-northd.h"
+#include "en-group-ecmp-route.h"
 #include "en-lflow.h"
 #include "en-northd-output.h"
 #include "en-meters.h"
@@ -57,6 +58,10 @@ static unixctl_cb_func chassis_features_list;
     NB_NODE(load_balancer_group, "load_balancer_group") \
     NB_NODE(acl, "acl") \
     NB_NODE(logical_router, "logical_router") \
+    NB_NODE(logical_router_port, "logical_router_port") \
+    NB_NODE(logical_router_static_route, "logical_router_static_route") \
+    NB_NODE(logical_router_policy, "logical_router_policy") \
+    NB_NODE(nat, "nat") \
     NB_NODE(mirror, "mirror") \
     NB_NODE(meter, "meter") \
     NB_NODE(bfd, "bfd") \
@@ -138,6 +143,7 @@ enum sb_engine_node {
  * avoid sparse errors. */
 static ENGINE_NODE_WITH_CLEAR_TRACK_DATA(northd, "northd");
 static ENGINE_NODE(sync_from_sb, "sync_from_sb");
+static ENGINE_NODE_WITH_CLEAR_TRACK_DATA(group_ecmp_route, "group_ecmp_route");
 static ENGINE_NODE(lflow, "lflow");
 static ENGINE_NODE(mac_binding_aging, "mac_binding_aging");
 static ENGINE_NODE(mac_binding_aging_waker, "mac_binding_aging_waker");
@@ -184,10 +190,13 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_northd, &en_sb_chassis, NULL);
     engine_add_input(&en_northd, &en_sb_mirror, NULL);
     engine_add_input(&en_northd, &en_sb_meter, NULL);
-    engine_add_input(&en_northd, &en_sb_datapath_binding, NULL);
-    engine_add_input(&en_northd, &en_sb_dns, NULL);
-    engine_add_input(&en_northd, &en_sb_ha_chassis_group, NULL);
-    engine_add_input(&en_northd, &en_sb_ip_multicast, NULL);
+    engine_add_input(&en_northd, &en_sb_datapath_binding,
+                     northd_sb_datapath_binding_handler);
+    engine_add_input(&en_northd, &en_sb_dns, engine_noop_handler);
+    engine_add_input(&en_northd, &en_sb_ha_chassis_group,
+                     engine_noop_handler);
+    engine_add_input(&en_northd, &en_sb_ip_multicast,
+                     engine_noop_handler);
     engine_add_input(&en_northd, &en_sb_service_monitor, NULL);
     engine_add_input(&en_northd, &en_sb_fdb, NULL);
     engine_add_input(&en_northd, &en_sb_static_mac_binding, NULL);
@@ -212,6 +221,24 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
                      northd_nb_logical_switch_handler);
     engine_add_input(&en_northd, &en_nb_logical_router,
                      northd_nb_logical_router_handler);
+
+    /* Router sub-table inputs.  Changes to these sub-tables also update
+     * the parent Logical_Router row's column (ports, static_routes,
+     * policies, nat), which is handled by northd_nb_logical_router_handler.
+     * Use noop_handler here to avoid redundant recompute. */
+    engine_add_input(&en_northd, &en_nb_logical_router_port,
+                     northd_nb_logical_router_port_handler);
+    engine_add_input(&en_northd, &en_nb_logical_router_static_route,
+                     northd_nb_static_route_handler);
+    /* Policy and NAT sub-table changes are fully handled by the LR
+     * handler via is_lr_policies_changed() / is_lr_nats_changed(),
+     * which detect both column changes and referenced row seqno
+     * changes.  Use noop_handler to acknowledge without recompute. */
+    engine_add_input(&en_northd, &en_nb_logical_router_policy,
+                     engine_noop_handler);
+    engine_add_input(&en_northd, &en_nb_nat,
+                     engine_noop_handler);
+
     engine_add_input(&en_northd, &en_lb_data, northd_lb_data_handler);
 
     engine_add_input(&en_lr_nat, &en_northd, lr_nat_northd_handler);
@@ -241,17 +268,31 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
     engine_add_input(&en_sync_meters, &en_nb_meter, NULL);
     engine_add_input(&en_sync_meters, &en_sb_meter, NULL);
 
+    /* group_ecmp_route preprocesses ECMP grouping from northd data. */
+    engine_add_input(&en_group_ecmp_route, &en_northd,
+                     en_group_ecmp_route_northd_handler);
+
     engine_add_input(&en_lflow, &en_nb_bfd, NULL);
     engine_add_input(&en_lflow, &en_nb_acl, NULL);
     engine_add_input(&en_lflow, &en_sync_meters, NULL);
     engine_add_input(&en_lflow, &en_sb_bfd, NULL);
-    engine_add_input(&en_lflow, &en_sb_logical_flow, NULL);
-    engine_add_input(&en_lflow, &en_sb_multicast_group, NULL);
+    /* Logical_Flow, Multicast_Group, and Logical_DP_Group are written
+     * exclusively by northd/lflow.  SB feedback from our own writes
+     * must not trigger lflow recompute — use noop_handler.
+     * IGMP_Group is written by ovn-controller, so keep NULL (recompute
+     * on external IGMP changes is correct). */
+    engine_add_input(&en_lflow, &en_sb_logical_flow,
+                     engine_noop_handler);
+    engine_add_input(&en_lflow, &en_sb_multicast_group,
+                     engine_noop_handler);
     engine_add_input(&en_lflow, &en_sb_igmp_group, NULL);
-    engine_add_input(&en_lflow, &en_sb_logical_dp_group, NULL);
+    engine_add_input(&en_lflow, &en_sb_logical_dp_group,
+                     engine_noop_handler);
     engine_add_input(&en_lflow, &en_global_config,
                      node_global_config_handler);
     engine_add_input(&en_lflow, &en_northd, lflow_northd_handler);
+    engine_add_input(&en_lflow, &en_group_ecmp_route,
+                     lflow_group_ecmp_route_handler);
     engine_add_input(&en_lflow, &en_port_group, lflow_port_group_handler);
     engine_add_input(&en_lflow, &en_lr_stateful, lflow_lr_stateful_handler);
     engine_add_input(&en_lflow, &en_ls_stateful, lflow_ls_stateful_handler);

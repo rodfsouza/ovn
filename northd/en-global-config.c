@@ -197,7 +197,12 @@ global_config_nb_global_handler(struct engine_node *node, void *data)
         return false;
     }
 
-    /* We are only interested in ipsec and options column. */
+    struct ed_type_global_config *config_data = data;
+    config_data->tracked = true;
+
+    /* We are only interested in ipsec and options column.
+     * Other columns (sb_cfg, nb_cfg_timestamp, etc.) are updated by
+     * update_sequence_numbers() every cycle — ignore them. */
     if (!nbrec_nb_global_is_updated(nb, NBREC_NB_GLOBAL_COL_IPSEC)
         && !nbrec_nb_global_is_updated(nb, NBREC_NB_GLOBAL_COL_OPTIONS)) {
         return true;
@@ -206,9 +211,6 @@ global_config_nb_global_handler(struct engine_node *node, void *data)
     if (nb->ipsec != sb->ipsec) {
         sbrec_sb_global_set_ipsec(sb, nb->ipsec);
     }
-
-    struct ed_type_global_config *config_data = data;
-    config_data->tracked = true;
 
     if (smap_equal(&nb->options, &config_data->nb_options)) {
         return true;
@@ -601,25 +603,13 @@ static bool
 chassis_features_changed(const struct chassis_features *present,
                          const struct chassis_features *updated)
 {
-    if (present->ct_no_masked_label != updated->ct_no_masked_label) {
-        return true;
-    }
-
-    if (present->mac_binding_timestamp != updated->mac_binding_timestamp) {
-        return true;
-    }
-
-    if (present->ct_lb_related != updated->ct_lb_related) {
-        return true;
-    }
-
-    if (present->fdb_timestamp != updated->fdb_timestamp) {
-        return true;
-    }
-
-    if (present->ls_dpg_column != updated->ls_dpg_column) {
-        return true;
-    }
-
-    return false;
+    return present->ct_no_masked_label != updated->ct_no_masked_label
+        || present->mac_binding_timestamp != updated->mac_binding_timestamp
+        || present->ct_lb_related != updated->ct_lb_related
+        || present->fdb_timestamp != updated->fdb_timestamp
+        || present->ls_dpg_column != updated->ls_dpg_column
+        || present->ct_commit_nat_v2 != updated->ct_commit_nat_v2
+        || present->ct_commit_to_zone != updated->ct_commit_to_zone
+        || present->ct_next_zone != updated->ct_next_zone
+        || present->ct_state_save != updated->ct_state_save;
 }
