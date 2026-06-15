@@ -13955,3 +13955,78 @@ CHECK_NO_CHANGE_AFTER_RECOMPUTE
 OVN_CLEANUP_NORTHD
 AT_CLEANUP
 ])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ovn -- static route incremental processing (per-route delta)])
+AT_KEYWORDS([incremental static-route delta])
+
+ovn_start
+
+# Set up an LR with a connected LRP so route nexthops resolve.
+check ovn-nbctl lr-add lr0
+check ovn-nbctl --wait=sb lrp-add lr0 lr0-lrp1 \
+    00:00:00:00:00:01 192.168.1.1/24
+
+# --- Add a single route to an existing LR (per-route delta path).
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-route-add lr0 10.0.0.0/24 192.168.1.2
+
+check_engine_stats northd norecompute compute
+check_engine_stats group_ecmp_route norecompute compute
+check_engine_stats lflow norecompute compute
+wait_row_count Logical_Flow 1 \
+    match='"reg7 == 0 && ip4.dst == 10.0.0.0/24"'
+
+# --- Add a second route at a different prefix (still per-route delta).
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-route-add lr0 10.0.1.0/24 192.168.1.3
+
+check_engine_stats northd norecompute compute
+check_engine_stats group_ecmp_route norecompute compute
+check_engine_stats lflow norecompute compute
+wait_row_count Logical_Flow 1 \
+    match='"reg7 == 0 && ip4.dst == 10.0.1.0/24"'
+
+# --- Modify the nexthop of an existing route (modify delta path).
+route_uuid=$(ovn-nbctl --bare --columns=_uuid find \
+    Logical_Router_Static_Route ip_prefix=10.0.0.0/24)
+AT_CHECK([test -n "$route_uuid"])
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb set Logical_Router_Static_Route \
+    "$route_uuid" nexthop=192.168.1.4
+
+check_engine_stats northd norecompute compute
+check_engine_stats group_ecmp_route norecompute compute
+check_engine_stats lflow norecompute compute
+
+# --- Delete a route (delete delta path).
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-route-del lr0 10.0.0.0/24
+
+check_engine_stats northd norecompute compute
+check_engine_stats group_ecmp_route norecompute compute
+check_engine_stats lflow norecompute compute
+wait_row_count Logical_Flow 0 \
+    match='"reg7 == 0 && ip4.dst == 10.0.0.0/24"'
+
+# --- BFD column change still forces full recompute (escape hatch).
+check ovn-nbctl --wait=sb create BFD logical_port=lr0-lrp1 \
+    dst_ip=192.168.1.5 min_rx=1000 min_tx=1000
+bfd_uuid=$(ovn-nbctl --bare --columns=_uuid find BFD \
+    logical_port=lr0-lrp1)
+route2_uuid=$(ovn-nbctl --bare --columns=_uuid find \
+    Logical_Router_Static_Route ip_prefix=10.0.1.0/24)
+AT_CHECK([test -n "$bfd_uuid"])
+AT_CHECK([test -n "$route2_uuid"])
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb set Logical_Router_Static_Route \
+    "$route2_uuid" bfd="$bfd_uuid"
+check_engine_stats northd recompute nocompute
+
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])

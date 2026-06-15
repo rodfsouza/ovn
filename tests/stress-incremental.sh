@@ -330,6 +330,65 @@ done
 
 echo ""
 # -------------------------------------------------------------------
+echo "--- Phase 5c: Dense LR — Single Route Add/Del with N=100 ---"
+# -------------------------------------------------------------------
+# Exercises the per-route delta path: add a single route to an LR
+# pre-populated with many routes, assert it remains incremental, and
+# verify SB Logical_Flow churn is bounded by the route delta (not by N).
+# Uses a separate LR so it doesn't interfere with other phases.
+ovn-nbctl --wait=sb lr-add stress-lr-dense >/dev/null
+ovn-nbctl --wait=sb lrp-add stress-lr-dense dense-lrp1 \
+    00:00:00:99:99:01 172.16.0.1/16 >/dev/null
+
+# Bulk-add 100 routes in a single txn to keep setup fast.
+bulk_args=()
+for i in $(seq 1 100); do
+    bulk_args+=(-- lr-route-add stress-lr-dense \
+                "10.50.$i.0/24" "172.16.0.$(( (i % 254) + 2 ))")
+done
+ovn-nbctl --wait=sb "${bulk_args[@]}" >/dev/null
+
+# Snapshot SB Logical_Flow UUIDs (only for this LR's pipeline) before
+# the next operation. Filter to flows referencing the LR's datapath is
+# overkill here — count of all SB flows works as the bound check.
+sb_before=$(ovn-sbctl --bare --columns=_uuid find Logical_Flow | sort)
+sb_before_count=$(echo "$sb_before" | grep -c . || true)
+
+clear_stats
+ovn-nbctl --wait=sb lr-route-add stress-lr-dense 10.99.99.0/24 172.16.0.99
+assert_incremental "dense LR (N=100): single route add"
+
+sb_after_add=$(ovn-sbctl --bare --columns=_uuid find Logical_Flow | sort)
+sb_after_add_count=$(echo "$sb_after_add" | grep -c . || true)
+new_uuids=$(comm -13 <(echo "$sb_before") <(echo "$sb_after_add") | grep -c . || true)
+removed_uuids=$(comm -23 <(echo "$sb_before") <(echo "$sb_after_add") | grep -c . || true)
+# Threshold: a single unique IPv4 route adds ~3-5 flows (routing + arp_resolve
+# + arp_request). 20 is comfortably above this and well below the full LR
+# flow count, so a regression that re-emits the whole LR's flows will fail.
+if [ "$new_uuids" -le 20 ] && [ "$removed_uuids" -le 5 ]; then
+    log_pass "dense LR add: SB churn bounded (+$new_uuids/-$removed_uuids)"
+else
+    log_fail "dense LR add: SB churn too high (+$new_uuids/-$removed_uuids); expected ≤ +20/-5"
+fi
+
+clear_stats
+ovn-nbctl --wait=sb lr-route-del stress-lr-dense 10.99.99.0/24
+assert_incremental "dense LR (N=100): single route del"
+
+sb_after_del=$(ovn-sbctl --bare --columns=_uuid find Logical_Flow | sort)
+new_uuids=$(comm -13 <(echo "$sb_after_add") <(echo "$sb_after_del") | grep -c . || true)
+removed_uuids=$(comm -23 <(echo "$sb_after_add") <(echo "$sb_after_del") | grep -c . || true)
+if [ "$new_uuids" -le 5 ] && [ "$removed_uuids" -le 20 ]; then
+    log_pass "dense LR del: SB churn bounded (+$new_uuids/-$removed_uuids)"
+else
+    log_fail "dense LR del: SB churn too high (+$new_uuids/-$removed_uuids); expected ≤ +5/-20"
+fi
+
+# Cleanup this phase's LR so subsequent phases see consistent state.
+ovn-nbctl --wait=sb lr-del stress-lr-dense >/dev/null
+
+echo ""
+# -------------------------------------------------------------------
 echo "--- Phase 6: Policies — Add (x5) ---"
 # -------------------------------------------------------------------
 for i in $(seq 1 5); do
