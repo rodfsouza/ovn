@@ -195,6 +195,254 @@ parsed_route_lookup_by_uuid(const struct group_ecmp_datapath *ged,
     return NULL;
 }
 
+/* Helpers used by both the full re-walk and the per-route delta path. */
+
+static void
+populate_route_tables_from_lrp_options(const struct ovn_datapath *od,
+                                       struct simap *route_tables)
+{
+    for (int i = 0; i < od->nbr->n_ports; i++) {
+        const char *rt = smap_get(&od->nbr->ports[i]->options,
+                                  "route_table");
+        if (rt && rt[0]) {
+            get_route_table_id(route_tables, rt);
+        }
+    }
+}
+
+/* Allocate a route_node owning a fresh lflow_ref, insert into ged->route_nodes
+ * keyed by the right hash, and return it. For ECMP groups, payload is the
+ * ecmp_groups_node *; for unique routes, payload is the parsed_route *.
+ * Does NOT set parsed_route back-pointers — caller is responsible. */
+static struct ecmp_route_node *
+allocate_route_node(struct group_ecmp_datapath *ged, bool is_ecmp,
+                    const void *payload)
+{
+    struct ecmp_route_node *rn = xzalloc(sizeof *rn);
+    rn->od = ged->od;
+    rn->lflow_ref = lflow_ref_create();
+    rn->is_ecmp = is_ecmp;
+    uint32_t hash;
+    if (is_ecmp) {
+        rn->group = CONST_CAST(struct ecmp_groups_node *, payload);
+        hash = uuid_hash(&ged->od->key) ^ rn->group->id;
+    } else {
+        rn->route = (const struct parsed_route *) payload;
+        hash = uuid_hash(&rn->route->route->header_.uuid);
+    }
+    hmap_insert(&ged->route_nodes, &rn->hmap_node, hash);
+    return rn;
+}
+
+/* Find the route_node that backs an ECMP group within a ged. */
+static struct ecmp_route_node *
+group_route_node_of(const struct group_ecmp_datapath *ged,
+                    const struct ecmp_groups_node *eg)
+{
+    uint32_t hash = uuid_hash(&ged->od->key) ^ eg->id;
+    struct ecmp_route_node *rn;
+    HMAP_FOR_EACH_WITH_HASH (rn, hmap_node, hash, &ged->route_nodes) {
+        if (rn->is_ecmp && rn->group == eg) {
+            return rn;
+        }
+    }
+    return NULL;
+}
+
+/* Remove pr from an ECMP group's route_list. Updates route_count and
+ * recomputes has_discard_route. Returns the count after removal (>= 0). */
+static uint16_t
+ecmp_group_remove_route(struct ecmp_groups_node *eg,
+                        const struct parsed_route *pr)
+{
+    struct ecmp_route_list_node *er;
+    LIST_FOR_EACH_SAFE (er, list_node, &eg->route_list) {
+        if (er->route == pr) {
+            ovs_list_remove(&er->list_node);
+            free(er);
+            eg->route_count--;
+            break;
+        }
+    }
+    /* Recompute has_discard_route flag from remaining members. */
+    eg->has_discard_route = false;
+    LIST_FOR_EACH (er, list_node, &eg->route_list) {
+        if (er->route->is_discard_route) {
+            eg->has_discard_route = true;
+            break;
+        }
+    }
+    return eg->route_count;
+}
+
+/* Per-route delta handlers. Each takes the engine data and the ged it
+ * operates on; they mutate ged in place and push tracked-data entries for
+ * en-lflow to consume. Returns false on unrecoverable inconsistency, in
+ * which case the caller MUST NOT claim the LR for the delta path — letting
+ * the LR re-walk fix the bookkeeping. */
+
+static bool
+handle_route_delete_delta(struct group_ecmp_route_data *data,
+                          struct group_ecmp_datapath *ged,
+                          struct parsed_route *pr)
+{
+    struct ecmp_route_node *rn = pr->route_node;
+    if (!rn) {
+        return false;
+    }
+
+    if (rn->is_ecmp) {
+        struct ecmp_groups_node *eg = rn->group;
+        uint16_t remaining = ecmp_group_remove_route(eg, pr);
+
+        if (remaining >= 2) {
+            /* Group still ECMP; flow content (bundle members) changed.
+             * Keep the same route_node and lflow_ref pointer; mark
+             * crupdated so en-lflow re-emits. */
+            hmapx_add(&data->trk_data.crupdated_datapath_routes, rn);
+        } else if (remaining == 1) {
+            /* Demote group → unique route. */
+            struct ecmp_route_list_node *survivor_er = CONTAINER_OF(
+                ovs_list_front(&eg->route_list),
+                struct ecmp_route_list_node, list_node);
+            const struct parsed_route *surviving = survivor_er->route;
+            ovs_list_remove(&survivor_er->list_node);
+            free(survivor_er);
+            hmap_remove(&ged->ecmp_groups, &eg->hmap_node);
+            free(eg);
+
+            /* Old ECMP route_node dies. */
+            hmap_remove(&ged->route_nodes, &rn->hmap_node);
+            hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+
+            /* Promote survivor to unique_routes with a new route_node. */
+            unique_routes_add(&ged->unique_routes, surviving);
+            struct ecmp_route_node *new_rn =
+                allocate_route_node(ged, /*is_ecmp=*/false, surviving);
+            CONST_CAST(struct parsed_route *, surviving)->route_node = new_rn;
+            hmapx_add(&data->trk_data.crupdated_datapath_routes, new_rn);
+        } else {
+            /* Group empty; destroy it and the route_node. */
+            hmap_remove(&ged->ecmp_groups, &eg->hmap_node);
+            free(eg);
+            hmap_remove(&ged->route_nodes, &rn->hmap_node);
+            hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+        }
+    } else {
+        /* Unique route — straight delete. */
+        unique_routes_remove(&ged->unique_routes, pr);
+        hmap_remove(&ged->route_nodes, &rn->hmap_node);
+        hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+    }
+
+    /* Tear down the parsed_route itself. */
+    hmap_remove(&ged->parsed_routes_by_uuid, &pr->key_node);
+    ovs_list_remove(&pr->list_node);
+    pr->route_node = NULL;
+    free(pr);
+    return true;
+}
+
+static bool
+handle_route_add_delta(struct group_ecmp_route_data *data,
+                       struct group_ecmp_datapath *ged,
+                       const struct nbrec_logical_router_static_route *nb_route,
+                       const struct hmap *lr_ports)
+{
+    struct simap route_tables = SIMAP_INITIALIZER(&route_tables);
+    populate_route_tables_from_lrp_options(ged->od, &route_tables);
+
+    struct parsed_route *pr = parsed_routes_add(
+        CONST_CAST(struct ovn_datapath *, ged->od), lr_ports,
+        &ged->parsed_routes, &route_tables, nb_route, NULL);
+    simap_destroy(&route_tables);
+    if (!pr) {
+        /* Parse failed — the LR re-walk will produce the same outcome
+         * (route silently omitted). Don't claim. */
+        return false;
+    }
+
+    hmap_insert(&ged->parsed_routes_by_uuid, &pr->key_node,
+                uuid_hash(&nb_route->header_.uuid));
+
+    /* Case A: existing ECMP group at this prefix → join. */
+    struct ecmp_groups_node *group =
+        ecmp_groups_find(&ged->ecmp_groups, pr);
+    if (group) {
+        ecmp_groups_add_route(group, pr);
+        struct ecmp_route_node *rn = group_route_node_of(ged, group);
+        if (!rn) {
+            return false;
+        }
+        pr->route_node = rn;
+        hmapx_add(&data->trk_data.crupdated_datapath_routes, rn);
+        return true;
+    }
+
+    /* Case B: existing unique route at same prefix → promote both to ECMP. */
+    const struct parsed_route *existed =
+        unique_routes_remove(&ged->unique_routes, pr);
+    if (existed) {
+        struct ecmp_route_node *old_rn =
+            CONST_CAST(struct parsed_route *, existed)->route_node;
+        if (old_rn) {
+            hmap_remove(&ged->route_nodes, &old_rn->hmap_node);
+            hmapx_add(&data->trk_data.deleted_datapath_routes, old_rn);
+        }
+
+        group = ecmp_groups_add(&ged->ecmp_groups, existed);
+        if (!group) {
+            return false;
+        }
+        ecmp_groups_add_route(group, pr);
+
+        struct ecmp_route_node *new_rn =
+            allocate_route_node(ged, /*is_ecmp=*/true, group);
+        CONST_CAST(struct parsed_route *, existed)->route_node = new_rn;
+        pr->route_node = new_rn;
+        hmapx_add(&data->trk_data.crupdated_datapath_routes, new_rn);
+        return true;
+    }
+
+    /* Case C: ecmp_symmetric_reply route → solo ECMP group of 1. */
+    if (pr->ecmp_symmetric_reply) {
+        group = ecmp_groups_add(&ged->ecmp_groups, pr);
+        if (!group) {
+            return false;
+        }
+        struct ecmp_route_node *new_rn =
+            allocate_route_node(ged, /*is_ecmp=*/true, group);
+        pr->route_node = new_rn;
+        hmapx_add(&data->trk_data.crupdated_datapath_routes, new_rn);
+        return true;
+    }
+
+    /* Case D: plain unique route. */
+    unique_routes_add(&ged->unique_routes, pr);
+    struct ecmp_route_node *new_rn =
+        allocate_route_node(ged, /*is_ecmp=*/false, pr);
+    pr->route_node = new_rn;
+    hmapx_add(&data->trk_data.crupdated_datapath_routes, new_rn);
+    return true;
+}
+
+static bool
+handle_route_modify_delta(struct group_ecmp_route_data *data,
+                          struct group_ecmp_datapath *ged,
+                          const struct nbrec_logical_router_static_route *nb_route,
+                          const struct hmap *lr_ports)
+{
+    struct parsed_route *old_pr =
+        parsed_route_lookup_by_uuid(ged, &nb_route->header_.uuid);
+    if (!old_pr) {
+        return false;
+    }
+    if (!handle_route_delete_delta(data, ged, old_pr)) {
+        return false;
+    }
+    return handle_route_add_delta(data, ged, nb_route, lr_ports);
+}
+
 static void
 group_ecmp_datapath_destroy(struct group_ecmp_datapath *ged)
 {
@@ -378,11 +626,86 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
 
     struct group_ecmp_route_data *data = data_;
 
+    /* Per-route delta path: O(K) updates touching only the affected
+     * route_nodes. LRs claimed here are skipped by the per-LR re-walk
+     * below. Any LR for which a delta helper returns false stays
+     * unclaimed → re-walk handles it for safety. */
+    struct hmapx handled_by_delta = HMAPX_INITIALIZER(&handled_by_delta);
+    if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES_DELTA) {
+        /* DELETIONS first — may demote ECMP groups to unique, providing a
+         * clean baseline for any subsequent adds at the same prefix. */
+        struct deleted_route_node *drn;
+        HMAP_FOR_EACH (drn, node,
+                       &northd_data->trk_data.trk_routes_deleted) {
+            struct group_ecmp_datapath *ged =
+                group_ecmp_datapath_lookup(data, drn->od);
+            if (!ged) {
+                continue;
+            }
+            struct parsed_route *pr =
+                parsed_route_lookup_by_uuid(ged, &drn->route_uuid);
+            if (!pr) {
+                continue;
+            }
+            if (handle_route_delete_delta(data, ged, pr)) {
+                hmapx_add(&handled_by_delta, drn->od);
+            }
+        }
+
+        /* MODIFICATIONS — delete + add of the same UUID. */
+        struct modified_route_node *mrn;
+        HMAP_FOR_EACH (mrn, node,
+                       &northd_data->trk_data.trk_routes_modified) {
+            struct group_ecmp_datapath *ged =
+                group_ecmp_datapath_lookup(data, mrn->od);
+            if (!ged) {
+                continue;
+            }
+            if (handle_route_modify_delta(data, ged, mrn->nb_route,
+                                          &northd_data->lr_ports)) {
+                hmapx_add(&handled_by_delta, mrn->od);
+            }
+        }
+
+        /* ADDITIONS. */
+        struct hmapx_node *hn;
+        HMAPX_FOR_EACH (hn, &northd_data->trk_data.trk_routes_added) {
+            const struct nbrec_logical_router_static_route *nb_route =
+                hn->data;
+            struct ovn_datapath *od = route_to_lr_map_find(
+                &northd_data->route_to_lr_map, nb_route);
+            if (!od) {
+                continue;
+            }
+            struct group_ecmp_datapath *ged =
+                group_ecmp_datapath_lookup(data, od);
+            if (!ged) {
+                /* New-LR-with-routes — NORTHD_TRACKED_LR_CREATED branch
+                 * below will build the whole ged from scratch. Don't
+                 * claim. */
+                continue;
+            }
+            if (handle_route_add_delta(data, ged, nb_route,
+                                       &northd_data->lr_ports)) {
+                hmapx_add(&handled_by_delta, od);
+            }
+        }
+
+        if (!hmapx_is_empty(&data->trk_data.crupdated_datapath_routes) ||
+            !hmapx_is_empty(&data->trk_data.deleted_datapath_routes)) {
+            engine_set_node_state(node, EN_UPDATED);
+        }
+    }
+
     if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES) {
         struct hmapx_node *hmapx_node;
         HMAPX_FOR_EACH (hmapx_node,
                         &northd_data->trk_data.lr_with_changed_routes) {
             struct ovn_datapath *od = hmapx_node->data;
+            if (hmapx_contains(&handled_by_delta, od)) {
+                /* Already handled by per-route delta path. */
+                continue;
+            }
             struct group_ecmp_datapath *ged =
                 group_ecmp_datapath_lookup(data, od);
 
@@ -567,5 +890,6 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
         engine_set_node_state(node, EN_UPDATED);
     }
 
+    hmapx_destroy(&handled_by_delta);
     return true;
 }
