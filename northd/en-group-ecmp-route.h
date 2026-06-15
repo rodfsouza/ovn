@@ -72,6 +72,13 @@ struct group_ecmp_datapath {
     struct ovs_list parsed_routes;
     struct hmap parsed_routes_by_uuid;
     struct hmap route_nodes;
+    /* Monotonically increases on each ecmp_groups_add().  Used as the
+     * group's REG_ECMP_GROUP_ID, embedded literally in flow content.
+     * Persists across per-route delta mutations so two long-lived groups
+     * never share an id (which would collide REG_ECMP_GROUP_ID matches in
+     * SB Logical_Flow).  Reset to 0 only by the full re-walk path, which
+     * rebuilds all groups from scratch. */
+    uint16_t next_ecmp_id;
 };
 
 struct group_ecmp_route_tracked_data {
@@ -100,7 +107,7 @@ struct parsed_route *parsed_route_lookup_by_uuid(
 
 void ecmp_groups_add_route(struct ecmp_groups_node *group,
                            const struct parsed_route *route);
-struct ecmp_groups_node *ecmp_groups_add(struct hmap *ecmp_groups,
+struct ecmp_groups_node *ecmp_groups_add(struct group_ecmp_datapath *ged,
                                         const struct parsed_route *route);
 struct ecmp_groups_node *ecmp_groups_find(struct hmap *ecmp_groups,
                                          struct parsed_route *route);

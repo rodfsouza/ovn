@@ -55,19 +55,24 @@ ecmp_groups_add_route(struct ecmp_groups_node *group,
 }
 
 struct ecmp_groups_node *
-ecmp_groups_add(struct hmap *ecmp_groups,
+ecmp_groups_add(struct group_ecmp_datapath *ged,
                 const struct parsed_route *route)
 {
-    if (hmap_count(ecmp_groups) == UINT16_MAX) {
+    if (hmap_count(&ged->ecmp_groups) == UINT16_MAX
+        || ged->next_ecmp_id == UINT16_MAX) {
+        /* The id is embedded in REG_ECMP_GROUP_ID (16-bit), so exhausting
+         * next_ecmp_id forces the caller to fall back to a full re-walk,
+         * which resets the counter to 0. */
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-        VLOG_WARN_RL(&rl, "too many ecmp groups.");
+        VLOG_WARN_RL(&rl,
+                     "too many ecmp groups or group id space exhausted.");
         return NULL;
     }
 
     struct ecmp_groups_node *eg = xzalloc(sizeof *eg);
-    hmap_insert(ecmp_groups, &eg->hmap_node, route->hash);
+    hmap_insert(&ged->ecmp_groups, &eg->hmap_node, route->hash);
 
-    eg->id = hmap_count(ecmp_groups);
+    eg->id = ++ged->next_ecmp_id;
     eg->prefix = route->prefix;
     eg->plen = route->plen;
     eg->is_src_route = route->is_src_route;
@@ -432,7 +437,7 @@ handle_route_add_delta(struct group_ecmp_route_data *data,
             route_node_retire(data, freshly_allocated, old_rn);
         }
 
-        group = ecmp_groups_add(&ged->ecmp_groups, existed);
+        group = ecmp_groups_add(ged, existed);
         if (!group) {
             return false;
         }
@@ -447,7 +452,7 @@ handle_route_add_delta(struct group_ecmp_route_data *data,
 
     /* Case C: ecmp_symmetric_reply route → solo ECMP group of 1. */
     if (pr->ecmp_symmetric_reply) {
-        group = ecmp_groups_add(&ged->ecmp_groups, pr);
+        group = ecmp_groups_add(ged, pr);
         if (!group) {
             return false;
         }
@@ -554,12 +559,12 @@ group_ecmp_route(struct group_ecmp_route_data *data,
             const struct parsed_route *existed_route =
                 unique_routes_remove(&ged->unique_routes, route);
             if (existed_route) {
-                group = ecmp_groups_add(&ged->ecmp_groups, existed_route);
+                group = ecmp_groups_add(ged, existed_route);
                 if (group) {
                     ecmp_groups_add_route(group, route);
                 }
             } else if (route->ecmp_symmetric_reply) {
-                ecmp_groups_add(&ged->ecmp_groups, route);
+                ecmp_groups_add(ged, route);
             } else {
                 unique_routes_add(&ged->unique_routes, route);
             }
@@ -785,6 +790,10 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
 
                 ecmp_groups_destroy(&ged->ecmp_groups);
                 hmap_init(&ged->ecmp_groups);
+                /* Re-walk rebuilds groups from scratch; reset the id
+                 * counter so ids are sequential and don't drift across
+                 * recompute cycles. */
+                ged->next_ecmp_id = 0;
                 unique_routes_destroy(&ged->unique_routes);
                 hmap_init(&ged->unique_routes);
                 hmap_destroy(&ged->parsed_routes_by_uuid);
@@ -818,13 +827,12 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                         const struct parsed_route *existed =
                             unique_routes_remove(&ged->unique_routes, route);
                         if (existed) {
-                            group = ecmp_groups_add(&ged->ecmp_groups,
-                                                    existed);
+                            group = ecmp_groups_add(ged, existed);
                             if (group) {
                                 ecmp_groups_add_route(group, route);
                             }
                         } else if (route->ecmp_symmetric_reply) {
-                            ecmp_groups_add(&ged->ecmp_groups, route);
+                            ecmp_groups_add(ged, route);
                         } else {
                             unique_routes_add(&ged->unique_routes, route);
                         }
