@@ -288,6 +288,11 @@ group_ecmp_route(struct group_ecmp_route_data *data,
         rn->group = eg;
         hmap_insert(&ged->route_nodes, &rn->hmap_node,
                     uuid_hash(&od->key) ^ eg->id);
+        /* Set back-pointer on every group member's parsed_route. */
+        struct ecmp_route_list_node *er;
+        LIST_FOR_EACH (er, list_node, &eg->route_list) {
+            CONST_CAST(struct parsed_route *, er->route)->route_node = rn;
+        }
     }
     const struct unique_routes_node *ur;
     HMAP_FOR_EACH (ur, hmap_node, &ged->unique_routes) {
@@ -298,6 +303,7 @@ group_ecmp_route(struct group_ecmp_route_data *data,
         rn->route = ur->route;
         hmap_insert(&ged->route_nodes, &rn->hmap_node,
                     uuid_hash(&ur->route->route->header_.uuid));
+        CONST_CAST(struct parsed_route *, ur->route)->route_node = rn;
     }
 }
 
@@ -465,6 +471,12 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                     rn->lflow_ref = lflow_ref_create();
                     hmap_insert(&ged->route_nodes, &rn->hmap_node, hash);
                     hmapx_add(&data->trk_data.crupdated_datapath_routes, rn);
+                    /* Set back-pointer on every group member. */
+                    struct ecmp_route_list_node *er;
+                    LIST_FOR_EACH (er, list_node, &eg->route_list) {
+                        CONST_CAST(struct parsed_route *,
+                                   er->route)->route_node = rn;
+                    }
                 }
                 const struct unique_routes_node *ur;
                 HMAP_FOR_EACH (ur, hmap_node, &ged->unique_routes) {
@@ -497,6 +509,8 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                     }
 
                     hmap_insert(&ged->route_nodes, &rn->hmap_node, hash);
+                    CONST_CAST(struct parsed_route *,
+                               ur->route)->route_node = rn;
                 }
 
                 /* Remaining old route_nodes are deleted routes. */
@@ -505,6 +519,15 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                     hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
                 }
                 hmap_destroy(&old_route_nodes);
+                /* Old parsed_routes' back-pointers may point to old_rn's
+                 * being freed at clear_tracked_data time. NULL them here
+                 * for hygiene before destroying the snapshot list — though
+                 * they are not dereferenced (not in parsed_routes_by_uuid)
+                 * during the window. */
+                struct parsed_route *opr;
+                LIST_FOR_EACH (opr, list_node, &old_parsed_routes) {
+                    opr->route_node = NULL;
+                }
                 parsed_routes_destroy(&old_parsed_routes);
             } else {
                 /* Router had no routes before, build from scratch. */

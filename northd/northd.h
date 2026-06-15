@@ -814,6 +814,11 @@ bool lflow_handle_northd_lb_changes(struct ovsdb_idl_txn *ovnsb_txn,
                                     struct tracked_lbs *,
                                     struct lflow_input *,
                                     struct lflow_table *lflows);
+/* Forward decl from en-group-ecmp-route.h; back-pointer below lets us locate
+ * the owning route_node from a parsed_route in O(1) for per-route incremental
+ * updates. */
+struct ecmp_route_node;
+
 /* Parsed static route — used by northd.c and en-group-ecmp-route.c. */
 struct parsed_route {
     struct ovs_list list_node;
@@ -827,6 +832,12 @@ struct parsed_route {
     bool ecmp_symmetric_reply;
     bool is_discard_route;
     bool stale;
+    /* Back-pointer to the route_node that owns this parsed_route's lflow_ref.
+     * For unique routes, points to the unique route_node. For ECMP-grouped
+     * routes, all members of the same group share the same route_node here.
+     * NULL when no route_node currently exists. Invariant maintained by
+     * en-group-ecmp-route.c at every allocation and free site. */
+    struct ecmp_route_node *route_node;
 };
 
 static inline uint32_t
