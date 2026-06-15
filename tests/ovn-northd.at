@@ -13974,8 +13974,11 @@ check ovn-nbctl --wait=sb lr-route-add lr0 10.0.0.0/24 192.168.1.2
 check_engine_stats northd norecompute compute
 check_engine_stats group_ecmp_route norecompute compute
 check_engine_stats lflow norecompute compute
-wait_row_count Logical_Flow 1 \
-    match='"reg7 == 0 && ip4.dst == 10.0.0.0/24"'
+# Use fetch_column rather than wait_row_count: the latter passes its
+# condition unquoted, which word-splits a match= filter containing spaces.
+sr_lflow_uuid=$(fetch_column Logical_flow _uuid \
+    match='"reg7 == 0 && ip4.dst == 10.0.0.0/24"')
+AT_CHECK([test -n "$sr_lflow_uuid"])
 
 # --- Add a second route at a different prefix (still per-route delta).
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
@@ -13984,8 +13987,9 @@ check ovn-nbctl --wait=sb lr-route-add lr0 10.0.1.0/24 192.168.1.3
 check_engine_stats northd norecompute compute
 check_engine_stats group_ecmp_route norecompute compute
 check_engine_stats lflow norecompute compute
-wait_row_count Logical_Flow 1 \
-    match='"reg7 == 0 && ip4.dst == 10.0.1.0/24"'
+sr_lflow_uuid=$(fetch_column Logical_flow _uuid \
+    match='"reg7 == 0 && ip4.dst == 10.0.1.0/24"')
+AT_CHECK([test -n "$sr_lflow_uuid"])
 
 # --- Modify the nexthop of an existing route (modify delta path).
 route_uuid=$(ovn-nbctl --bare --columns=_uuid find \
@@ -14007,8 +14011,9 @@ check ovn-nbctl --wait=sb lr-route-del lr0 10.0.0.0/24
 check_engine_stats northd norecompute compute
 check_engine_stats group_ecmp_route norecompute compute
 check_engine_stats lflow norecompute compute
-wait_row_count Logical_Flow 0 \
-    match='"reg7 == 0 && ip4.dst == 10.0.0.0/24"'
+sr_lflow_uuid=$(fetch_column Logical_flow _uuid \
+    match='"reg7 == 0 && ip4.dst == 10.0.0.0/24"')
+AT_CHECK([test -z "$sr_lflow_uuid"])
 
 # --- ECMP cascade regression: 2 routes sharing a prefix form a group;
 # deleting both in one txn previously double-tracked the demoted unique
@@ -14030,8 +14035,9 @@ check ovn-nbctl --wait=sb \
 check_engine_stats northd norecompute compute
 check_engine_stats group_ecmp_route norecompute compute
 check_engine_stats lflow norecompute compute
-wait_row_count Logical_Flow 0 \
-    match='"reg7 == 0 && ip4.dst == 10.0.5.0/24"'
+sr_lflow_uuid=$(fetch_column Logical_flow _uuid \
+    match='"reg7 == 0 && ip4.dst == 10.0.5.0/24"')
+AT_CHECK([test -z "$sr_lflow_uuid"])
 
 # --- BFD column change still forces full recompute (escape hatch).
 check ovn-nbctl --wait=sb create BFD logical_port=lr0-lrp1 \
