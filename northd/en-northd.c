@@ -278,9 +278,11 @@ northd_nb_static_route_handler(struct engine_node *node, void *data)
         }
 
         /* Push to trk_routes_modified so the per-route delta consumer
-         * can update only the affected route_node. Also fall back to
-         * the existing lr_with_changed_routes path until Commit 3 wires
-         * the consumer — this preserves correctness during the rollout. */
+         * can update only the affected route_node.  Also add the LR to
+         * lr_with_changed_routes as a safety net: if the delta helper
+         * later returns false (parse failure, missing back-pointer, id
+         * exhaustion), the LR is not claimed by handled_by_delta and the
+         * legacy re-walk path runs to fix bookkeeping. */
         struct modified_route_node *mrn = xmalloc(sizeof *mrn);
         mrn->nb_route = route;
         mrn->od = od;

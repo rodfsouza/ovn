@@ -276,6 +276,10 @@ route_node_retire(struct group_ecmp_route_data *data,
         free(rn);
         return;
     }
+    /* Guard the invariant "no rn in both crupdated and deleted" — that's
+     * what the original UAF (fixed in 8a5a9b5f1) violated. */
+    ovs_assert(!hmapx_contains(&data->trk_data.deleted_datapath_routes,
+                               rn));
     hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
 }
 
@@ -435,6 +439,9 @@ handle_route_add_delta(struct group_ecmp_route_data *data,
         if (old_rn) {
             hmap_remove(&ged->route_nodes, &old_rn->hmap_node);
             route_node_retire(data, freshly_allocated, old_rn);
+            /* old_rn may be freed by retire; null the dangling pointer
+             * before any intermediate code can read it. */
+            CONST_CAST(struct parsed_route *, existed)->route_node = NULL;
         }
 
         group = ecmp_groups_add(ged, existed);
@@ -470,6 +477,13 @@ handle_route_add_delta(struct group_ecmp_route_data *data,
     return true;
 }
 
+/* Modify = delete + add of the same NB UUID.  If the add half fails
+ * (parse error, id exhaustion, etc.), the delete has already committed
+ * and we return false WITHOUT claiming the LR.  Correctness then
+ * depends on the legacy re-walk path running for that LR — which the
+ * static_route handler guarantees by also adding the LR to
+ * lr_with_changed_routes.  The re-walk rebuilds ged from od->nbr, so
+ * the half-deleted state is repaired. */
 static bool
 handle_route_modify_delta(struct group_ecmp_route_data *data,
                           struct group_ecmp_datapath *ged,
