@@ -14039,6 +14039,76 @@ sr_lflow_uuid=$(fetch_column Logical_flow _uuid \
     match='"reg7 == 0 && ip4.dst == 10.0.5.0/24"')
 AT_CHECK([test -z "$sr_lflow_uuid"])
 
+# --- Promote unique → ECMP via a second route at the same prefix
+# (handle_route_add_delta Case B).  Establish a unique route, then add
+# another at the same prefix in a fresh txn and assert incremental.
+check ovn-nbctl --wait=sb lr-route-add lr0 10.0.10.0/24 192.168.1.20
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb lr-route-add lr0 10.0.10.0/24 192.168.1.21
+check_engine_stats northd norecompute compute
+check_engine_stats group_ecmp_route norecompute compute
+check_engine_stats lflow norecompute compute
+sr_lflow_uuid=$(fetch_column Logical_flow _uuid \
+    match='"reg7 == 0 && ip4.dst == 10.0.10.0/24"')
+AT_CHECK([test -n "$sr_lflow_uuid"])
+
+# --- Demote ECMP-of-2 → unique by deleting one member.  Surviving member
+# becomes a unique route_node.  Different from the cascade test which
+# destroys the group entirely.
+demote_uuid=$(ovn-nbctl --bare --columns=_uuid find \
+    Logical_Router_Static_Route ip_prefix=10.0.10.0/24 nexthop=192.168.1.21)
+AT_CHECK([test -n "$demote_uuid"])
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb \
+    remove Logical_Router lr0 static_routes "$demote_uuid"
+check_engine_stats northd norecompute compute
+check_engine_stats group_ecmp_route norecompute compute
+check_engine_stats lflow norecompute compute
+sr_lflow_uuid=$(fetch_column Logical_flow _uuid \
+    match='"reg7 == 0 && ip4.dst == 10.0.10.0/24"')
+AT_CHECK([test -n "$sr_lflow_uuid"])
+
+# --- ECMP group id collision regression (post-c47d97b18 review C1).
+# Sequence: promote A (10.0.20/24), promote B (10.0.21/24), demote A by
+# deleting both members, then promote C (10.0.22/24).  Before the fix,
+# `eg->id = hmap_count(ecmp_groups)` reassigned C the id A had vacated
+# — which collided with B (still live).  The collision produced ECMP
+# member flows with identical (stage, priority, match) but different
+# actions, neither deduped by ovn_lflow_find nor reconcilable at OF.
+# After the fix, next_ecmp_id is monotonic per ged, so B and C carry
+# distinct REG_ECMP_GROUP_ID values.
+check ovn-nbctl --wait=sb \
+    -- lr-route-add lr0 10.0.20.0/24 192.168.1.30 \
+    -- lr-route-add lr0 10.0.20.0/24 192.168.1.31 \
+    -- lr-route-add lr0 10.0.21.0/24 192.168.1.40 \
+    -- lr-route-add lr0 10.0.21.0/24 192.168.1.41
+demote_a_x=$(ovn-nbctl --bare --columns=_uuid find \
+    Logical_Router_Static_Route ip_prefix=10.0.20.0/24 nexthop=192.168.1.30)
+demote_a_y=$(ovn-nbctl --bare --columns=_uuid find \
+    Logical_Router_Static_Route ip_prefix=10.0.20.0/24 nexthop=192.168.1.31)
+AT_CHECK([test -n "$demote_a_x"])
+AT_CHECK([test -n "$demote_a_y"])
+check ovn-nbctl --wait=sb \
+    -- remove Logical_Router lr0 static_routes "$demote_a_x" \
+    -- remove Logical_Router lr0 static_routes "$demote_a_y"
+check ovn-nbctl --wait=sb \
+    -- lr-route-add lr0 10.0.22.0/24 192.168.1.50 \
+    -- lr-route-add lr0 10.0.22.0/24 192.168.1.51
+
+# Extract REG_ECMP_GROUP_ID assigned to each surviving group's parent
+# flow.  Format inside actions: "reg8[0..15] = <id>".
+action_21=$(fetch_column Logical_flow actions \
+    match='"reg7 == 0 && ip4.dst == 10.0.21.0/24"')
+action_22=$(fetch_column Logical_flow actions \
+    match='"reg7 == 0 && ip4.dst == 10.0.22.0/24"')
+id_21=$(echo "$action_21" | grep -oE 'reg8\[0\.\.15\] = [0-9]+' \
+    | head -1 | awk '{print $NF}')
+id_22=$(echo "$action_22" | grep -oE 'reg8\[0\.\.15\] = [0-9]+' \
+    | head -1 | awk '{print $NF}')
+AT_CHECK([test -n "$id_21"])
+AT_CHECK([test -n "$id_22"])
+AT_CHECK([test "$id_21" != "$id_22"])
+
 # --- BFD column change still forces full recompute (escape hatch).
 # Capture UUID from `create` directly: `check` expects empty stdout and
 # would fail on the UUID line that `create` prints.
