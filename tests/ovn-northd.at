@@ -14040,10 +14040,10 @@ sr_lflow_uuid=$(fetch_column Logical_flow _uuid \
 AT_CHECK([test -z "$sr_lflow_uuid"])
 
 # --- BFD column change still forces full recompute (escape hatch).
-check ovn-nbctl --wait=sb create BFD logical_port=lr0-lrp1 \
-    dst_ip=192.168.1.5 min_rx=1000 min_tx=1000
-bfd_uuid=$(ovn-nbctl --bare --columns=_uuid find BFD \
-    logical_port=lr0-lrp1)
+# Capture UUID from `create` directly: `check` expects empty stdout and
+# would fail on the UUID line that `create` prints.
+bfd_uuid=$(ovn-nbctl --wait=sb create BFD logical_port=lr0-lrp1 \
+    dst_ip=192.168.1.5 min_rx=1000 min_tx=1000)
 route2_uuid=$(ovn-nbctl --bare --columns=_uuid find \
     Logical_Router_Static_Route ip_prefix=10.0.1.0/24)
 AT_CHECK([test -n "$bfd_uuid"])
