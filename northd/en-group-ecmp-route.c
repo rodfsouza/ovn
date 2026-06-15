@@ -234,6 +234,46 @@ allocate_route_node(struct group_ecmp_datapath *ged, bool is_ecmp,
     return rn;
 }
 
+/* Allocate a route_node and remember it in freshly_allocated. Used by the
+ * per-route delta path so a later delta deleting the same route_node can
+ * recognize it as fresh (no live SB flows yet) and free it directly,
+ * rather than putting it in deleted_datapath_routes where en-lflow would
+ * also iterate it as crupdated → use-after-free. */
+static struct ecmp_route_node *
+allocate_route_node_tracked(struct group_ecmp_datapath *ged,
+                            struct group_ecmp_route_data *data,
+                            struct hmapx *freshly_allocated,
+                            bool is_ecmp, const void *payload)
+{
+    struct ecmp_route_node *rn = allocate_route_node(ged, is_ecmp, payload);
+    hmapx_add(freshly_allocated, rn);
+    hmapx_add(&data->trk_data.crupdated_datapath_routes, rn);
+    return rn;
+}
+
+/* Transition rn out of "live" state.
+ *
+ * If rn was freshly allocated this handler invocation, its lflow_ref has
+ * never been visited by en-lflow → no SB flows registered → safe to free
+ * directly. Otherwise hand off to deleted_datapath_routes for en-lflow to
+ * unlink the SB flows it owns.
+ *
+ * In both cases, ensure rn is no longer in crupdated_datapath_routes so the
+ * invariant "no rn in both sets" holds when en-lflow iterates them. */
+static void
+route_node_retire(struct group_ecmp_route_data *data,
+                  struct hmapx *freshly_allocated,
+                  struct ecmp_route_node *rn)
+{
+    hmapx_find_and_delete(&data->trk_data.crupdated_datapath_routes, rn);
+    if (hmapx_find_and_delete(freshly_allocated, rn)) {
+        lflow_ref_destroy(rn->lflow_ref);
+        free(rn);
+        return;
+    }
+    hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+}
+
 /* Find the route_node that backs an ECMP group within a ged. */
 static struct ecmp_route_node *
 group_route_node_of(const struct group_ecmp_datapath *ged,
@@ -284,6 +324,7 @@ ecmp_group_remove_route(struct ecmp_groups_node *eg,
 static bool
 handle_route_delete_delta(struct group_ecmp_route_data *data,
                           struct group_ecmp_datapath *ged,
+                          struct hmapx *freshly_allocated,
                           struct parsed_route *pr)
 {
     struct ecmp_route_node *rn = pr->route_node;
@@ -313,26 +354,26 @@ handle_route_delete_delta(struct group_ecmp_route_data *data,
 
             /* Old ECMP route_node dies. */
             hmap_remove(&ged->route_nodes, &rn->hmap_node);
-            hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+            route_node_retire(data, freshly_allocated, rn);
 
             /* Promote survivor to unique_routes with a new route_node. */
             unique_routes_add(&ged->unique_routes, surviving);
-            struct ecmp_route_node *new_rn =
-                allocate_route_node(ged, /*is_ecmp=*/false, surviving);
+            struct ecmp_route_node *new_rn = allocate_route_node_tracked(
+                ged, data, freshly_allocated,
+                /*is_ecmp=*/false, surviving);
             CONST_CAST(struct parsed_route *, surviving)->route_node = new_rn;
-            hmapx_add(&data->trk_data.crupdated_datapath_routes, new_rn);
         } else {
             /* Group empty; destroy it and the route_node. */
             hmap_remove(&ged->ecmp_groups, &eg->hmap_node);
             free(eg);
             hmap_remove(&ged->route_nodes, &rn->hmap_node);
-            hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+            route_node_retire(data, freshly_allocated, rn);
         }
     } else {
         /* Unique route — straight delete. */
         unique_routes_remove(&ged->unique_routes, pr);
         hmap_remove(&ged->route_nodes, &rn->hmap_node);
-        hmapx_add(&data->trk_data.deleted_datapath_routes, rn);
+        route_node_retire(data, freshly_allocated, rn);
     }
 
     /* Tear down the parsed_route itself. */
@@ -346,6 +387,7 @@ handle_route_delete_delta(struct group_ecmp_route_data *data,
 static bool
 handle_route_add_delta(struct group_ecmp_route_data *data,
                        struct group_ecmp_datapath *ged,
+                       struct hmapx *freshly_allocated,
                        const struct nbrec_logical_router_static_route *nb_route,
                        const struct hmap *lr_ports)
 {
@@ -387,7 +429,7 @@ handle_route_add_delta(struct group_ecmp_route_data *data,
             CONST_CAST(struct parsed_route *, existed)->route_node;
         if (old_rn) {
             hmap_remove(&ged->route_nodes, &old_rn->hmap_node);
-            hmapx_add(&data->trk_data.deleted_datapath_routes, old_rn);
+            route_node_retire(data, freshly_allocated, old_rn);
         }
 
         group = ecmp_groups_add(&ged->ecmp_groups, existed);
@@ -396,11 +438,10 @@ handle_route_add_delta(struct group_ecmp_route_data *data,
         }
         ecmp_groups_add_route(group, pr);
 
-        struct ecmp_route_node *new_rn =
-            allocate_route_node(ged, /*is_ecmp=*/true, group);
+        struct ecmp_route_node *new_rn = allocate_route_node_tracked(
+            ged, data, freshly_allocated, /*is_ecmp=*/true, group);
         CONST_CAST(struct parsed_route *, existed)->route_node = new_rn;
         pr->route_node = new_rn;
-        hmapx_add(&data->trk_data.crupdated_datapath_routes, new_rn);
         return true;
     }
 
@@ -410,25 +451,24 @@ handle_route_add_delta(struct group_ecmp_route_data *data,
         if (!group) {
             return false;
         }
-        struct ecmp_route_node *new_rn =
-            allocate_route_node(ged, /*is_ecmp=*/true, group);
+        struct ecmp_route_node *new_rn = allocate_route_node_tracked(
+            ged, data, freshly_allocated, /*is_ecmp=*/true, group);
         pr->route_node = new_rn;
-        hmapx_add(&data->trk_data.crupdated_datapath_routes, new_rn);
         return true;
     }
 
     /* Case D: plain unique route. */
     unique_routes_add(&ged->unique_routes, pr);
-    struct ecmp_route_node *new_rn =
-        allocate_route_node(ged, /*is_ecmp=*/false, pr);
+    struct ecmp_route_node *new_rn = allocate_route_node_tracked(
+        ged, data, freshly_allocated, /*is_ecmp=*/false, pr);
     pr->route_node = new_rn;
-    hmapx_add(&data->trk_data.crupdated_datapath_routes, new_rn);
     return true;
 }
 
 static bool
 handle_route_modify_delta(struct group_ecmp_route_data *data,
                           struct group_ecmp_datapath *ged,
+                          struct hmapx *freshly_allocated,
                           const struct nbrec_logical_router_static_route *nb_route,
                           const struct hmap *lr_ports)
 {
@@ -437,10 +477,11 @@ handle_route_modify_delta(struct group_ecmp_route_data *data,
     if (!old_pr) {
         return false;
     }
-    if (!handle_route_delete_delta(data, ged, old_pr)) {
+    if (!handle_route_delete_delta(data, ged, freshly_allocated, old_pr)) {
         return false;
     }
-    return handle_route_add_delta(data, ged, nb_route, lr_ports);
+    return handle_route_add_delta(data, ged, freshly_allocated,
+                                  nb_route, lr_ports);
 }
 
 static void
@@ -629,8 +670,15 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
     /* Per-route delta path: O(K) updates touching only the affected
      * route_nodes. LRs claimed here are skipped by the per-LR re-walk
      * below. Any LR for which a delta helper returns false stays
-     * unclaimed → re-walk handles it for safety. */
+     * unclaimed → re-walk handles it for safety.
+     *
+     * freshly_allocated tracks route_nodes created during this handler
+     * invocation. If a later delta in the same invocation deletes one,
+     * route_node_retire() frees it directly instead of moving it to
+     * deleted_datapath_routes — preventing en-lflow from iterating a
+     * route_node whose parsed_route has already been freed. */
     struct hmapx handled_by_delta = HMAPX_INITIALIZER(&handled_by_delta);
+    struct hmapx freshly_allocated = HMAPX_INITIALIZER(&freshly_allocated);
     if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES_DELTA) {
         /* DELETIONS first — may demote ECMP groups to unique, providing a
          * clean baseline for any subsequent adds at the same prefix. */
@@ -647,7 +695,8 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
             if (!pr) {
                 continue;
             }
-            if (handle_route_delete_delta(data, ged, pr)) {
+            if (handle_route_delete_delta(data, ged, &freshly_allocated,
+                                          pr)) {
                 hmapx_add(&handled_by_delta, drn->od);
             }
         }
@@ -661,7 +710,8 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
             if (!ged) {
                 continue;
             }
-            if (handle_route_modify_delta(data, ged, mrn->nb_route,
+            if (handle_route_modify_delta(data, ged, &freshly_allocated,
+                                          mrn->nb_route,
                                           &northd_data->lr_ports)) {
                 hmapx_add(&handled_by_delta, mrn->od);
             }
@@ -685,7 +735,8 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
                  * claim. */
                 continue;
             }
-            if (handle_route_add_delta(data, ged, nb_route,
+            if (handle_route_add_delta(data, ged, &freshly_allocated,
+                                       nb_route,
                                        &northd_data->lr_ports)) {
                 hmapx_add(&handled_by_delta, od);
             }
@@ -696,6 +747,7 @@ en_group_ecmp_route_northd_handler(struct engine_node *node, void *data_)
             engine_set_node_state(node, EN_UPDATED);
         }
     }
+    hmapx_destroy(&freshly_allocated);
 
     if (northd_data->trk_data.type & NORTHD_TRACKED_LR_ROUTES) {
         struct hmapx_node *hmapx_node;

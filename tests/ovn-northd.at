@@ -14010,6 +14010,29 @@ check_engine_stats lflow norecompute compute
 wait_row_count Logical_Flow 0 \
     match='"reg7 == 0 && ip4.dst == 10.0.0.0/24"'
 
+# --- ECMP cascade regression: 2 routes sharing a prefix form a group;
+# deleting both in one txn previously double-tracked the demoted unique
+# route_node (in both crupdated AND deleted) and SIGSEGV'd en-lflow.
+check ovn-nbctl --wait=sb \
+    -- lr-route-add lr0 10.0.5.0/24 192.168.1.10 \
+    -- lr-route-add lr0 10.0.5.0/24 192.168.1.11
+ecmp_a_uuid=$(ovn-nbctl --bare --columns=_uuid find \
+    Logical_Router_Static_Route nexthop=192.168.1.10)
+ecmp_b_uuid=$(ovn-nbctl --bare --columns=_uuid find \
+    Logical_Router_Static_Route nexthop=192.168.1.11)
+AT_CHECK([test -n "$ecmp_a_uuid"])
+AT_CHECK([test -n "$ecmp_b_uuid"])
+
+check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
+check ovn-nbctl --wait=sb \
+    -- remove Logical_Router lr0 static_routes "$ecmp_a_uuid" \
+    -- remove Logical_Router lr0 static_routes "$ecmp_b_uuid"
+check_engine_stats northd norecompute compute
+check_engine_stats group_ecmp_route norecompute compute
+check_engine_stats lflow norecompute compute
+wait_row_count Logical_Flow 0 \
+    match='"reg7 == 0 && ip4.dst == 10.0.5.0/24"'
+
 # --- BFD column change still forces full recompute (escape hatch).
 check ovn-nbctl --wait=sb create BFD logical_port=lr0-lrp1 \
     dst_ip=192.168.1.5 min_rx=1000 min_tx=1000
