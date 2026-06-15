@@ -4452,6 +4452,18 @@ destroy_northd_data_tracked_changes(struct northd_data *nd)
     hmapx_clear(&trk_changes->trk_deleted_lrs);
     hmapx_clear(&trk_changes->lr_with_changed_routes);
     hmapx_clear(&trk_changes->lr_with_changed_policies);
+
+    /* Per-route deltas: free entries before clearing the hmaps. */
+    hmapx_clear(&trk_changes->trk_routes_added);
+    struct deleted_route_node *drn;
+    HMAP_FOR_EACH_POP (drn, node, &trk_changes->trk_routes_deleted) {
+        free(drn);
+    }
+    struct modified_route_node *mrn;
+    HMAP_FOR_EACH_POP (mrn, node, &trk_changes->trk_routes_modified) {
+        free(mrn);
+    }
+
     trk_changes->type = NORTHD_TRACKED_NONE;
 }
 
@@ -4474,6 +4486,9 @@ init_northd_tracked_data(struct northd_data *nd)
     hmapx_init(&trk_data->trk_deleted_lrs);
     hmapx_init(&trk_data->lr_with_changed_routes);
     hmapx_init(&trk_data->lr_with_changed_policies);
+    hmapx_init(&trk_data->trk_routes_added);
+    hmap_init(&trk_data->trk_routes_deleted);
+    hmap_init(&trk_data->trk_routes_modified);
 }
 
 static void
@@ -4495,6 +4510,11 @@ destroy_northd_tracked_data(struct northd_data *nd)
     hmapx_destroy(&trk_data->trk_deleted_lrs);
     hmapx_destroy(&trk_data->lr_with_changed_routes);
     hmapx_destroy(&trk_data->lr_with_changed_policies);
+    hmapx_destroy(&trk_data->trk_routes_added);
+    /* trk_routes_deleted / _modified entries were freed by
+     * destroy_northd_data_tracked_changes; hmap_destroy is safe now. */
+    hmap_destroy(&trk_data->trk_routes_deleted);
+    hmap_destroy(&trk_data->trk_routes_modified);
 }
 
 /* Check if a changed LSP can be handled incrementally within the I-P engine
@@ -5566,22 +5586,54 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 }
             }
 
-            /* Update route_to_lr_map for add/remove.
-             * Per-route change detection is handled by
-             * en_group_ecmp_route_northd_handler. */
+            /* Diff old route_to_lr_map entries vs the LR's new static_routes
+             * set. For each removed route, capture a deleted_route_node into
+             * trk_routes_deleted (with the LR datapath, since route_to_lr_map
+             * loses the mapping). For each added route, capture the NB row
+             * pointer into trk_routes_added and add to route_to_lr_map. */
             if (nbrec_logical_router_is_updated(changed_lr,
                     NBREC_LOGICAL_ROUTER_COL_STATIC_ROUTES)) {
+                /* Build set of NB row pointers for the LR's current
+                 * static_routes for O(1) membership checks. */
+                struct hmapx new_routes = HMAPX_INITIALIZER(&new_routes);
+                for (size_t i = 0; i < changed_lr->n_static_routes; i++) {
+                    hmapx_add(&new_routes, changed_lr->static_routes[i]);
+                }
+
+                /* Detect deletions: entries in map for this LR whose route
+                 * is no longer in the LR's static_routes set. */
                 struct route_lr_map_entry *e;
                 HMAP_FOR_EACH_SAFE (e, hmap_node, &nd->route_to_lr_map) {
-                    if (e->od == od) {
-                        hmap_remove(&nd->route_to_lr_map, &e->hmap_node);
-                        free(e);
+                    if (e->od != od) {
+                        continue;
                     }
+                    if (hmapx_contains(&new_routes, e->route)) {
+                        continue; /* Still present — keep mapping. */
+                    }
+                    /* Deleted route. */
+                    struct deleted_route_node *drn = xmalloc(sizeof *drn);
+                    drn->route_uuid = e->route->header_.uuid;
+                    drn->od = od;
+                    hmap_insert(&nd->trk_data.trk_routes_deleted,
+                                &drn->node,
+                                uuid_hash(&drn->route_uuid));
+                    hmap_remove(&nd->route_to_lr_map, &e->hmap_node);
+                    free(e);
                 }
+
+                /* Detect additions: entries in new_routes not yet in the map. */
                 for (size_t i = 0; i < changed_lr->n_static_routes; i++) {
-                    route_to_lr_map_add(&nd->route_to_lr_map,
-                                        changed_lr->static_routes[i], od);
+                    const struct nbrec_logical_router_static_route *sr =
+                        changed_lr->static_routes[i];
+                    if (route_to_lr_map_find(&nd->route_to_lr_map, sr)) {
+                        continue; /* Already mapped — not new. */
+                    }
+                    route_to_lr_map_add(&nd->route_to_lr_map, sr, od);
+                    hmapx_add(&nd->trk_data.trk_routes_added,
+                              (void *) sr);
                 }
+
+                hmapx_destroy(&new_routes);
             }
 
             hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
@@ -5608,6 +5660,12 @@ northd_handle_lr_changes(struct ovsdb_idl_txn *ovnsb_idl_txn,
 
     if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_routes)) {
         nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES;
+    }
+
+    if (!hmapx_is_empty(&nd->trk_data.trk_routes_added)
+        || !hmap_is_empty(&nd->trk_data.trk_routes_deleted)
+        || !hmap_is_empty(&nd->trk_data.trk_routes_modified)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES_DELTA;
     }
 
     if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_policies)) {

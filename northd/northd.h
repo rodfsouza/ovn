@@ -157,6 +157,24 @@ enum northd_tracked_data_type {
     NORTHD_TRACKED_LR_ROUTES  = (1 << 7),
     NORTHD_TRACKED_LR_POLICIES = (1 << 8),
     NORTHD_TRACKED_LR_PORTS    = (1 << 9),
+    /* Per-route delta tracking: NB rows that were added, deleted, or
+     * modified in this txn. Consumed by en_group_ecmp_route_northd_handler
+     * for O(1) per-route updates instead of full per-LR re-walk. */
+    NORTHD_TRACKED_LR_ROUTES_DELTA = (1 << 10),
+};
+
+/* Per-route delta entries. Captured during northd's input handlers and
+ * consumed by en_group_ecmp_route. */
+struct deleted_route_node {
+    struct hmap_node node;       /* In trk_routes_deleted, keyed by UUID. */
+    struct uuid route_uuid;      /* Captured by value — NB row is gone. */
+    struct ovn_datapath *od;     /* LR the route belonged to. */
+};
+
+struct modified_route_node {
+    struct hmap_node node;       /* In trk_routes_modified, keyed by UUID. */
+    const struct nbrec_logical_router_static_route *nb_route;
+    struct ovn_datapath *od;
 };
 
 /* Track what's changed in the northd engine node.
@@ -197,6 +215,18 @@ struct northd_tracked_data {
     /* Tracked routers whose policies have changed.
      * hmapx node data is 'struct ovn_datapath *'. */
     struct hmapx lr_with_changed_policies;
+
+    /* Per-route delta tracking. Populated alongside lr_with_changed_routes:
+     * the LR handler diffs old vs new LR.static_routes and pushes new/removed
+     * rows here (it has the LR datapath). The static_route handler pushes
+     * modify rows (the LR row is untouched on modify).
+     *
+     * Consumer: en_group_ecmp_route_northd_handler — uses these for O(1)
+     * per-route updates instead of the full re-walk. The fallback
+     * (lr_with_changed_routes re-walk) remains for safety. */
+    struct hmapx trk_routes_added;        /* of (const nbrec_..._static_route *) */
+    struct hmap  trk_routes_deleted;      /* of deleted_route_node, keyed by UUID */
+    struct hmap  trk_routes_modified;     /* of modified_route_node, keyed by UUID */
 };
 
 /* Maps nbrec_logical_router_port → parent ovn_datapath for O(1) lookup. */
@@ -939,6 +969,13 @@ static inline bool
 northd_has_lr_nats_in_tracked_data(struct northd_tracked_data *trk_nd_changes)
 {
     return trk_nd_changes->type & NORTHD_TRACKED_LR_NATS;
+}
+
+static inline bool
+northd_has_route_deltas_in_tracked_data(
+    const struct northd_tracked_data *trk_nd_changes)
+{
+    return trk_nd_changes->type & NORTHD_TRACKED_LR_ROUTES_DELTA;
 }
 
 static inline bool

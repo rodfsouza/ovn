@@ -254,8 +254,10 @@ northd_nb_static_route_handler(struct engine_node *node, void *data)
     NBREC_LOGICAL_ROUTER_STATIC_ROUTE_TABLE_FOR_EACH_TRACKED(
             route, table) {
 
-        /* New/deleted routes: parent LR's static_routes column
-         * also changes → LR handler processes these. */
+        /* New/deleted routes: parent LR's static_routes column also
+         * changes → northd_handle_lr_changes() populates
+         * trk_routes_added / trk_routes_deleted for these via its diff.
+         * No work needed here. */
         if (nbrec_logical_router_static_route_is_new(route)
             || nbrec_logical_router_static_route_is_deleted(route)) {
             continue;
@@ -275,11 +277,23 @@ northd_nb_static_route_handler(struct engine_node *node, void *data)
             return false;
         }
 
+        /* Push to trk_routes_modified so the per-route delta consumer
+         * can update only the affected route_node. Also fall back to
+         * the existing lr_with_changed_routes path until Commit 3 wires
+         * the consumer — this preserves correctness during the rollout. */
+        struct modified_route_node *mrn = xmalloc(sizeof *mrn);
+        mrn->nb_route = route;
+        mrn->od = od;
+        hmap_insert(&nd->trk_data.trk_routes_modified, &mrn->node,
+                    uuid_hash(&route->header_.uuid));
         hmapx_add(&nd->trk_data.lr_with_changed_routes, od);
     }
 
     if (!hmapx_is_empty(&nd->trk_data.lr_with_changed_routes)) {
         nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES;
+    }
+    if (!hmap_is_empty(&nd->trk_data.trk_routes_modified)) {
+        nd->trk_data.type |= NORTHD_TRACKED_LR_ROUTES_DELTA;
     }
     return true;
 }
